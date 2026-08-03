@@ -101,6 +101,55 @@ def _apply_block_top_p_coreset(
     return router_logits.masked_fill(~expert_mask.unsqueeze(0), mask_value)
 
 
+def _apply_block_prefix_topk_with_top1_escape(
+    router_logits: torch.Tensor,
+    top_k: int,
+    scoring_func: str,
+    use_grouped_topk: bool,
+    custom_routing_function: Callable | None,
+) -> torch.Tensor:
+    """Mask a verify block using prefix Top-k plus suffix Top-1 experts."""
+    prefix_k_text = envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_K
+    if not prefix_k_text:
+        return router_logits
+    try:
+        configured_prefix_k = int(prefix_k_text)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_ASCEND_DFLASH_MOE_PREFIX_K must be a non-negative integer, "
+            f"got {prefix_k_text!r}"
+        ) from exc
+    if configured_prefix_k < 0:
+        raise ValueError("VLLM_ASCEND_DFLASH_MOE_PREFIX_K must be non-negative")
+
+    if scoring_func != "softmax" or use_grouped_topk or custom_routing_function is not None:
+        return router_logits
+    if router_logits.ndim != 2 or not router_logits.dtype.is_floating_point:
+        return router_logits
+
+    num_tokens, num_experts = router_logits.shape
+    min_tokens = envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_MIN_TOKENS
+    max_tokens = envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_MAX_TOKENS
+    if min_tokens < 1 or max_tokens < 0:
+        raise ValueError("VLLM_ASCEND_DFLASH_MOE_PREFIX token limits must be non-negative")
+    if num_tokens < min_tokens or (max_tokens and num_tokens > max_tokens):
+        return router_logits
+
+    selected_k = min(top_k, num_experts)
+    original_top_ids = torch.topk(router_logits, selected_k, dim=-1).indices
+    prefix_k = min(configured_prefix_k, num_tokens)
+    allowed_mask = torch.zeros(num_experts, dtype=torch.bool, device=router_logits.device)
+    if prefix_k:
+        allowed_mask.scatter_(0, original_top_ids[:prefix_k].reshape(-1), True)
+    allowed_mask.scatter_(0, original_top_ids[prefix_k:, 0], True)
+
+    if configured_prefix_k >= num_tokens:
+        allowed_mask.fill_(True)
+
+    mask_value = torch.finfo(router_logits.dtype).min
+    return router_logits.masked_fill(~allowed_mask.unsqueeze(0), mask_value)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -143,6 +192,13 @@ def select_experts(
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
     router_logits = _apply_block_top_p_coreset(
+        router_logits=router_logits,
+        top_k=top_k,
+        scoring_func=scoring_func,
+        use_grouped_topk=use_grouped_topk,
+        custom_routing_function=custom_routing_function,
+    )
+    router_logits = _apply_block_prefix_topk_with_top1_escape(
         router_logits=router_logits,
         top_k=top_k,
         scoring_func=scoring_func,

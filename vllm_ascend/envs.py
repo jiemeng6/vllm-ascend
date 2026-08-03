@@ -128,6 +128,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_EXPERTS": lambda: int(
         os.getenv("VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_EXPERTS", "0")
     ),
+    # Prefix positions preserve their original Top-k experts; every suffix
+    # position contributes its original Top-1 expert. Empty disables it.
+    "VLLM_ASCEND_DFLASH_MOE_PREFIX_K": lambda: os.getenv(
+        "VLLM_ASCEND_DFLASH_MOE_PREFIX_K", ""
+    ),
+    # Apply prefix protection only to blocks within this token-count range.
+    # A maximum of 0 means no upper bound.
+    "VLLM_ASCEND_DFLASH_MOE_PREFIX_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_PREFIX_MIN_TOKENS", "2")
+    ),
+    "VLLM_ASCEND_DFLASH_MOE_PREFIX_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_PREFIX_MAX_TOKENS", "0")
+    ),
 }
 
 # end-env-vars-definition
