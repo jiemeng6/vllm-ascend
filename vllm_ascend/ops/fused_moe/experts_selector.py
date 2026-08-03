@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from vllm_ascend import envs
 from collections.abc import Callable
 
 import torch
@@ -24,6 +25,80 @@ from vllm.forward_context import get_forward_context
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
+
+
+def _env_int(name: str, default: int) -> int:
+    value = getattr(envs, name, None)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from exc
+
+
+def _apply_block_top_p_coreset(
+    router_logits: torch.Tensor,
+    top_k: int,
+    scoring_func: str,
+    use_grouped_topk: bool,
+    custom_routing_function: Callable | None,
+) -> torch.Tensor:
+    """Restrict one MoE forward block to a shared top-p expert coreset.
+
+    This experimental path is disabled unless VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P is
+    set. Rows in ``router_logits`` are treated as one verification block.
+    Token-count guards let experiments exclude prefill and normal decode.
+    """
+    top_p_text = envs.VLLM_ASCEND_VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P
+    if not top_p_text:
+        return router_logits
+    try:
+        top_p = float(top_p_text)
+    except ValueError as exc:
+        raise ValueError("VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P must be a float in (0, 1]") from exc
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P must be in (0, 1]")
+    if top_p == 1.0:
+        return router_logits
+
+    # Match the offline dense-softmax policy. Other routing policies need a
+    # separately defined block aggregation rule and are left unchanged.
+    if scoring_func != "softmax" or use_grouped_topk or custom_routing_function is not None:
+        return router_logits
+    if router_logits.ndim != 2 or not router_logits.dtype.is_floating_point:
+        return router_logits
+
+    num_tokens, num_experts = router_logits.shape
+    min_tokens = _env_int("VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_TOKENS", 2)
+    max_tokens = _env_int("VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_TOKENS", 0)
+    if min_tokens < 1 or max_tokens < 0:
+        raise ValueError("DFLASH_MOE_CORESET token limits must be non-negative")
+    if num_tokens < min_tokens or (max_tokens and num_tokens > max_tokens):
+        return router_logits
+
+    min_experts = max(top_k, _env_int("VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_EXPERTS", top_k))
+    max_experts = _env_int("VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_EXPERTS", num_experts)
+    if min_experts < top_k or max_experts < top_k:
+        raise ValueError("DFLASH_MOE_CORESET expert limits must be at least top_k")
+    min_experts = min(min_experts, num_experts)
+    max_experts = min(max_experts, num_experts)
+    if min_experts > max_experts:
+        raise ValueError("VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_EXPERTS exceeds MAX_EXPERTS")
+
+    probs = torch.softmax(router_logits.float(), dim=-1)
+    expert_score = probs.sum(dim=0)
+    sorted_score, sorted_ids = torch.sort(expert_score, descending=True)
+    cutoff = top_p * expert_score.sum()
+    active = torch.searchsorted(torch.cumsum(sorted_score, dim=0), cutoff).item() + 1
+    active = max(min_experts, min(int(active), max_experts))
+    if active >= num_experts:
+        return router_logits
+
+    expert_mask = torch.zeros(num_experts, dtype=torch.bool, device=router_logits.device)
+    expert_mask[sorted_ids[:active]] = True
+    mask_value = torch.finfo(router_logits.dtype).min
+    return router_logits.masked_fill(~expert_mask.unsqueeze(0), mask_value)
 
 
 def select_experts(
@@ -67,6 +142,14 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
+    router_logits = _apply_block_top_p_coreset(
+        router_logits=router_logits,
+        top_k=top_k,
+        scoring_func=scoring_func,
+        use_grouped_topk=use_grouped_topk,
+        custom_routing_function=custom_routing_function,
+    )
+
     is_support_npu_moe_gating_top_k = check_npu_moe_gating_top_k(
         hidden_states=hidden_states,
         top_k=top_k,

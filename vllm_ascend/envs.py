@@ -107,6 +107,27 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Experimental DFlash verify-block expert coreset. Empty disables it;
+    # otherwise the value must be a cumulative probability in (0, 1].
+    "VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P": lambda: os.getenv(
+        "VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P", ""
+    ),
+    # Apply the DFlash coreset only to blocks within this token-count range.
+    # A maximum of 0 means no upper bound.
+    "VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_TOKENS", "2")
+    ),
+    "VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_TOKENS", "0")
+    ),
+    # Lower and upper bounds for experts retained by the coreset. A maximum
+    # of 0 uses the model's full expert count.
+    "VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_EXPERTS": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_CORESET_MIN_EXPERTS", "0")
+    ),
+    "VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_EXPERTS": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_CORESET_MAX_EXPERTS", "0")
+    ),
 }
 
 # end-env-vars-definition
