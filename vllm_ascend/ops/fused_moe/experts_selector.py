@@ -50,7 +50,7 @@ def _apply_block_top_p_coreset(
     set. Rows in ``router_logits`` are treated as one verification block.
     Token-count guards let experiments exclude prefill and normal decode.
     """
-    top_p_text = envs.VLLM_ASCEND_VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P
+    top_p_text = envs.VLLM_ASCEND_DFLASH_MOE_CORESET_TOP_P
     if not top_p_text:
         return router_logits
     try:
