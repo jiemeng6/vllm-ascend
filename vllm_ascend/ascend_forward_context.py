@@ -71,6 +71,11 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    dflash_verify_rows=(),
+    dflash_mode="baseline",
+    dflash_prefix_k=None,
+    dflash_escape_rank=1,
+    dflash_prefill_masked_tokens=0,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -90,6 +95,13 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+        forward_context.dflash_verify_rows = dflash_verify_rows
+        forward_context.dflash_mode = dflash_mode
+        forward_context.dflash_prefix_k = dflash_prefix_k
+        forward_context.dflash_escape_rank = dflash_escape_rank
+        forward_context.dflash_prefill_masked_tokens = dflash_prefill_masked_tokens
+        forward_context.dflash_layer_union_sizes = []
+        forward_context.dflash_layer_baseline_union_sizes = []
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -191,7 +203,42 @@ def set_ascend_forward_context(
         try:
             yield
         finally:
-            pass
+            if dflash_verify_rows:
+                allowed_tensors = forward_context.dflash_layer_union_sizes
+                baseline_tensors = forward_context.dflash_layer_baseline_union_sizes
+                allowed_sizes = (
+                    torch.stack(allowed_tensors).to("cpu").tolist()
+                    if allowed_tensors
+                    else []
+                )
+                baseline_sizes = (
+                    torch.stack(baseline_tensors).to("cpu").tolist()
+                    if baseline_tensors
+                    else []
+                )
+                mean_allowed = (
+                    sum(allowed_sizes) / len(allowed_sizes) if allowed_sizes else 0.0
+                )
+                mean_baseline = (
+                    sum(baseline_sizes) / len(baseline_sizes) if baseline_sizes else 0.0
+                )
+                logger.info(
+                    "DFLASH_MASK mode=%s prefix_k=%s escape_rank=%d verify_bs=%d "
+                    "block_lengths=%s prefill_masked_tokens=%d moe_layers=%d "
+                    "mean_baseline_union_experts=%.4f mean_allowed_union_experts=%.4f "
+                    "layer_baseline_union_sizes=%s layer_allowed_union_sizes=%s",
+                    dflash_mode,
+                    dflash_prefix_k,
+                    dflash_escape_rank,
+                    len(dflash_verify_rows),
+                    [rows.numel() for _, rows in dflash_verify_rows],
+                    dflash_prefill_masked_tokens,
+                    len(allowed_sizes),
+                    mean_baseline,
+                    mean_allowed,
+                    baseline_sizes,
+                    allowed_sizes,
+                )
 
 
 _mc2_tokens_capacity: int | None = None

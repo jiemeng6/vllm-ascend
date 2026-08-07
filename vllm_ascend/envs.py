@@ -133,6 +133,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DFLASH_MOE_PREFIX_K": lambda: os.getenv(
         "VLLM_ASCEND_DFLASH_MOE_PREFIX_K", ""
     ),
+    # Multi-request DFlash verification policy. Empty preserves the legacy
+    # whole-block prefix behavior; baseline, union and version_b operate on
+    # explicit per-request verification rows supplied by the model runner.
+    "VLLM_ASCEND_DFLASH_MOE_PREFIX_MODE": lambda: os.getenv(
+        "VLLM_ASCEND_DFLASH_MOE_PREFIX_MODE", ""
+    ),
+    # Number of original suffix experts contributed to each request coreset.
+    "VLLM_ASCEND_DFLASH_MOE_ESCAPE_RANK": lambda: int(
+        os.getenv("VLLM_ASCEND_DFLASH_MOE_ESCAPE_RANK", "1")
+    ),
     # Apply prefix protection only to blocks within this token-count range.
     # A maximum of 0 means no upper bound.
     "VLLM_ASCEND_DFLASH_MOE_PREFIX_MIN_TOKENS": lambda: int(

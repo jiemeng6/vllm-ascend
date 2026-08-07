@@ -101,6 +101,79 @@ def _apply_block_top_p_coreset(
     return router_logits.masked_fill(~expert_mask.unsqueeze(0), mask_value)
 
 
+def _apply_dflash_request_coresets(
+    router_logits: torch.Tensor,
+    top_k: int,
+    scoring_func: str,
+    use_grouped_topk: bool,
+    custom_routing_function: Callable | None,
+) -> torch.Tensor:
+    """Apply union or request-private coresets to explicit verify rows."""
+    context = get_forward_context()
+    mode = getattr(context, "dflash_mode", "baseline")
+    verify_rows = getattr(context, "dflash_verify_rows", ())
+    prefix_k = getattr(context, "dflash_prefix_k", None)
+    escape_rank = getattr(context, "dflash_escape_rank", 1)
+    if not verify_rows:
+        return router_logits
+    if mode not in {"baseline", "union", "version_b"}:
+        raise ValueError(f"unsupported DFlash prefix mode: {mode!r}")
+    if mode != "baseline" and (prefix_k is None or prefix_k < 0):
+        raise ValueError("VLLM_ASCEND_DFLASH_MOE_PREFIX_K must be non-negative")
+    if escape_rank < 1 or escape_rank > top_k:
+        raise ValueError("DFlash escape rank must be in [1, top_k]")
+    if scoring_func != "softmax" or use_grouped_topk or custom_routing_function is not None:
+        return router_logits
+    if router_logits.ndim != 2 or not router_logits.dtype.is_floating_point:
+        return router_logits
+
+    num_experts = router_logits.shape[1]
+    selected_k = min(top_k, num_experts)
+    baseline_mask = torch.zeros(num_experts, dtype=torch.bool, device=router_logits.device)
+    request_data = []
+    private_masks = []
+    for request_id, rows in verify_rows:
+        del request_id
+        if rows.numel() == 0:
+            continue
+        if rows.device != router_logits.device:
+            raise ValueError("DFlash verification rows must be on the router-logits device")
+        ids = torch.topk(router_logits[rows], selected_k, dim=-1).indices
+        baseline_mask.scatter_(0, ids.reshape(-1), True)
+        if mode == "baseline":
+            continue
+        protected = min(prefix_k, rows.numel())
+        allowed = torch.zeros(num_experts, dtype=torch.bool, device=router_logits.device)
+        if protected:
+            allowed.scatter_(0, ids[:protected].reshape(-1), True)
+        if protected < rows.numel():
+            allowed.scatter_(0, ids[protected:, :escape_rank].reshape(-1), True)
+        private_masks.append(allowed)
+        request_data.append((rows, protected))
+
+    context.dflash_layer_baseline_union_sizes.append(baseline_mask.sum())
+    if mode == "baseline":
+        context.dflash_layer_union_sizes.append(baseline_mask.sum())
+        return router_logits
+    if not private_masks:
+        context.dflash_layer_union_sizes.append(baseline_mask.sum())
+        return router_logits
+
+    union_mask = torch.stack(private_masks).any(dim=0)
+    context.dflash_layer_union_sizes.append(union_mask.sum())
+    mask_value = torch.finfo(router_logits.dtype).min
+    masked = router_logits.clone()
+    for index, (rows, protected) in enumerate(request_data):
+        exposed_rows = rows[protected:]
+        if exposed_rows.numel() == 0:
+            continue
+        allowed = private_masks[index] if mode == "version_b" else union_mask
+        masked[exposed_rows] = masked[exposed_rows].masked_fill(
+            ~allowed.unsqueeze(0), mask_value
+        )
+    return masked
+
+
 def _apply_block_prefix_topk_with_top1_escape(
     router_logits: torch.Tensor,
     top_k: int,
@@ -109,6 +182,14 @@ def _apply_block_prefix_topk_with_top1_escape(
     custom_routing_function: Callable | None,
 ) -> torch.Tensor:
     """Mask a verify block using prefix Top-k plus suffix Top-1 experts."""
+    if envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_MODE.strip():
+        return _apply_dflash_request_coresets(
+            router_logits,
+            top_k,
+            scoring_func,
+            use_grouped_topk,
+            custom_routing_function,
+        )
     prefix_k_text = envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_K
     if not prefix_k_text:
         return router_logits
