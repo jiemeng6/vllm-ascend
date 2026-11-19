@@ -1164,7 +1164,13 @@ class NPUModelRunner(GPUModelRunner):
     ) -> AscendInputBatch:
         # vLLM #56456 added num_active_loras to prepare_inputs on main; it
         # only feeds FastPrefillHelper, which this Ascend path does not use.
-        return self._prepare_inputs_impl(scheduler_output, batch_req_state, batch_desc)
+        input_batch = self._prepare_inputs_impl(scheduler_output, batch_req_state, batch_desc)
+        if self.expert_offload_manager is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # Replay reads the same mask buffer captured by the offload graph.
+            padding = input_batch.is_padding
+            padding[: input_batch.num_tokens].fill_(False)
+            padding[input_batch.num_tokens :].fill_(True)
+        return input_batch
 
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False
