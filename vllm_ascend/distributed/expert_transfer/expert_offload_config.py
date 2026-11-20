@@ -124,7 +124,7 @@ def validate_expert_offload_config(
     if not pool_config.enabled:
         return
 
-    from .dspark_expert_pool import TOP_K
+    from vllm_ascend.ops.triton.deepseek_expert_pool import TOP_K
 
     draft_tokens = (
         speculative_config.num_speculative_tokens

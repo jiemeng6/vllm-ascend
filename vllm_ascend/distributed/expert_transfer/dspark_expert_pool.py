@@ -8,11 +8,13 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-TOP_K = 6
-
-UNRESTRICTED = 0
-CONTRIBUTOR = 1
-RESTRICTED = 2
+from vllm_ascend.ops.triton.deepseek_expert_pool import (
+    CONTRIBUTOR,
+    RESTRICTED,
+    TOP_K,
+    UNRESTRICTED,
+    route_experts,
+)
 
 
 def build_roles(
@@ -123,8 +125,6 @@ class DSparkExpertPool:
         self._prepare(batch, drafts, [False] * batch.num_reqs)
 
     def route(self, router, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm_ascend.ops.triton.deepseek_expert_pool import route_experts
-
         rows, experts = logits.shape
         if rows != self.num_rows or experts != router.num_logical_experts or logits.dtype != torch.float32:
             raise ValueError("DSpark routing requires aligned FP32 logits and one row per prepared token role")

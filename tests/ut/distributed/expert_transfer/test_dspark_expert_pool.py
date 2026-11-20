@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_ascend.distributed.expert_transfer import dspark_expert_pool as pool_module
 from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import (
     DSparkExpertPool,
     build_roles,
@@ -140,9 +140,7 @@ def test_capture_uses_the_configured_verify_width_for_all_requests():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_non_fp32_logits_are_rejected_before_kernel_dispatch(monkeypatch, dtype):
     route = Mock()
-    monkeypatch.setitem(
-        sys.modules, "vllm_ascend.ops.triton.deepseek_expert_pool", SimpleNamespace(route_experts=route)
-    )
+    monkeypatch.setattr(pool_module, "route_experts", route)
     pool = DSparkExpertPool(torch.device("cpu"), 6, 2, 2, num_speculative_tokens=5, num_device_experts=84)
     pool.num_rows = 6
     router = SimpleNamespace(num_logical_experts=256, e_score_correction_bias=None, routed_scaling_factor=1.5)
@@ -158,9 +156,7 @@ def test_fp32_logits_reach_kernel_unchanged_with_fp32_scratch(monkeypatch):
     weights = torch.full((6, 6), 0.25)
     ids = torch.zeros((6, 6), dtype=torch.int32)
     route = Mock(return_value=(weights, ids))
-    monkeypatch.setitem(
-        sys.modules, "vllm_ascend.ops.triton.deepseek_expert_pool", SimpleNamespace(route_experts=route)
-    )
+    monkeypatch.setattr(pool_module, "route_experts", route)
     pool = DSparkExpertPool(torch.device("cpu"), 6, 2, 2, num_speculative_tokens=5, num_device_experts=84)
     pool.num_rows = 6
     logits = torch.arange(6 * 256, dtype=torch.float32).reshape(6, 256)

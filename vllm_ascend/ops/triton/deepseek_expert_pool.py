@@ -6,7 +6,11 @@
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import CONTRIBUTOR, RESTRICTED, TOP_K
+TOP_K = 6
+
+UNRESTRICTED = 0
+CONTRIBUTOR = 1
+RESTRICTED = 2
 
 
 @triton.jit
