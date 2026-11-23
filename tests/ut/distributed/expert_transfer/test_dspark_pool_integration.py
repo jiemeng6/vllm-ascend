@@ -9,7 +9,7 @@ import torch
 from pydantic import TypeAdapter
 
 from vllm_ascend import ascend_config
-from vllm_ascend.ascend_config import DSparkExpertPoolConfig, ExpertOffloadConfig
+from vllm_ascend.ascend_config import ExpertOffloadConfig
 from vllm_ascend.distributed.expert_transfer import expert_offload_manager as manager_module
 from vllm_ascend.distributed.expert_transfer import expert_offload_utils as expert_offload
 from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
@@ -18,37 +18,40 @@ from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRo
 
 
 @pytest.mark.parametrize("enabled", [False, "false", "true"])
-def test_pool_config_uses_standard_bool_and_int_coercion(enabled):
-    config = TypeAdapter(DSparkExpertPoolConfig).validate_python(
-        {"enabled": enabled, "protected_positions": "2", "suffix_experts": "2"}
-    )
-    assert config.enabled is (enabled == "true")
-    assert config.protected_positions == config.suffix_experts == 2
-
-
-def test_pool_config_is_nested_under_expert_offload():
+@pytest.mark.parametrize("suffix", ["0", "2"])
+def test_flat_pool_config_uses_standard_bool_and_int_coercion(enabled, suffix):
     config = TypeAdapter(ExpertOffloadConfig).validate_python(
         {
-            "enabled": "true",
+            "enabled": enabled,
             "num_device_experts": "84",
-            "dspark_expert_pool": {"enabled": "true", "protected_positions": "2", "suffix_experts": "2"},
+            "dspark_protected_positions": "2",
+            "dspark_suffix_experts": suffix,
         }
     )
-    pool_config = getattr(config, "dspark_expert_pool", None)
-    assert pool_config is not None, "ExpertOffloadConfig must own the pool options"
-    assert pool_config.enabled and config.num_device_experts == 84
-    assert pool_config.protected_positions == pool_config.suffix_experts == 2
+    assert config.enabled is (enabled == "true")
+    assert config.num_device_experts == 84
+    assert config.dspark_protected_positions == 2
+    assert config.dspark_suffix_experts == int(suffix)
 
 
 @pytest.mark.parametrize("options", [{}, {"enabled": False}, {"enabled": True}])
-def test_legacy_top_level_pool_key_reports_its_new_location(monkeypatch, options):
+@pytest.mark.parametrize("nested", [False, True])
+def test_legacy_pool_key_reports_the_flat_fields(monkeypatch, options, nested):
     def unexpected_config_parsing(*args, **kwargs):
         pytest.fail("The legacy pool key must be rejected before unrelated config parsing")
 
     monkeypatch.setattr(ascend_config.SchedulerConfig, "from_additional_config", unexpected_config_parsing)
-    config = SimpleNamespace(additional_config={"dspark_expert_pool": options})
-    with pytest.raises(ValueError, match=r"expert_offload_config\.dspark_expert_pool"):
+    additional_config = {"dspark_expert_pool": options}
+    if nested:
+        additional_config = {"expert_offload_config": additional_config}
+    config = SimpleNamespace(additional_config=additional_config)
+    with pytest.raises(ValueError, match=r"expert_offload_config\.dspark_protected_positions.*dspark_suffix_experts"):
         ascend_config.init_ascend_config(config)
+
+
+def test_schema_rejects_the_removed_nested_pool_key():
+    with pytest.raises(ValueError, match="dspark_expert_pool"):
+        TypeAdapter(ExpertOffloadConfig).validate_python({"dspark_expert_pool": {"enabled": True}})
 
 
 def _make_pool_runner(expert_factory):
@@ -80,18 +83,23 @@ def _make_pool_runner(expert_factory):
         max_num_tokens=12,
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
         ascend_config=SimpleNamespace(
-            expert_offload_config=SimpleNamespace(
+            expert_offload_config=ExpertOffloadConfig(
                 enabled=True,
                 num_device_experts=84,
-                dspark_expert_pool=SimpleNamespace(enabled=True, protected_positions=2, suffix_experts=2),
+                dspark_protected_positions=2,
+                dspark_suffix_experts=2,
             )
         ),
     )
     return manager, runner, layers
 
 
-def test_manager_owns_one_pool_and_only_compatible_bindings_expose_it(expert_factory):
+@pytest.mark.parametrize("suffix", [0, 2])
+def test_manager_owns_one_pool_and_only_compatible_bindings_expose_it(expert_factory, suffix):
     manager, runner, layers = _make_pool_runner(expert_factory)
+    runner.ascend_config.expert_offload_config = ExpertOffloadConfig(
+        enabled=True, num_device_experts=84, dspark_protected_positions=2, dspark_suffix_experts=suffix
+    )
     initialize = getattr(manager, "initialize_dspark_expert_pool", None)
     assert callable(initialize), "The offload manager must initialize its shared pool"
     initialize(runner)
@@ -99,11 +107,23 @@ def test_manager_owns_one_pool_and_only_compatible_bindings_expose_it(expert_fac
     assert callable(get_pool), "Runner and model-state hooks need one model-owned lookup"
     pool = get_pool(runner.model)
     assert isinstance(pool, DSparkExpertPool)
+    assert pool.protected_positions == 2 and pool.suffix_experts == suffix
     assert pool is manager.dspark_expert_pool
     assert layers[0]._expert_offload_binding.dspark_expert_pool is pool
     assert layers[1]._expert_offload_binding.dspark_expert_pool is None
     assert not hasattr(runner, "dspark_expert_pool")
     assert all(not hasattr(layer, "dspark_expert_pool") for layer in layers)
+
+
+@pytest.mark.parametrize("offload_enabled", [False, True])
+def test_omitted_pool_parameters_do_not_allocate_a_pool(expert_factory, offload_enabled):
+    manager, runner, layers = _make_pool_runner(expert_factory)
+    runner.ascend_config.expert_offload_config = ExpertOffloadConfig(
+        enabled=offload_enabled, num_device_experts=84 if offload_enabled else None
+    )
+    manager.initialize_dspark_expert_pool(runner)
+    assert manager.dspark_expert_pool is None
+    assert all(layer._expert_offload_binding.dspark_expert_pool is None for layer in layers)
 
 
 def test_pool_shutdown_clears_binding_access(expert_factory, native_runtime):

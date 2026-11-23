@@ -123,22 +123,37 @@ def make_pool_configs(protected=2, suffix=2, *, method="dspark", draft_tokens=5)
     config = ExpertOffloadConfig(
         enabled=True,
         num_device_experts=84,
-        dspark_expert_pool={"enabled": True, "protected_positions": protected, "suffix_experts": suffix},
+        dspark_protected_positions=protected,
+        dspark_suffix_experts=suffix,
     )
     ac.expert_offload_config = config
     return config, vc, ac
 
 
-def test_pool_validation_rejects_enabled_pool_before_disabled_offload_returns():
+@pytest.mark.parametrize("suffix", [0, 2])
+def test_pool_validation_rejects_enabled_pool_before_disabled_offload_returns(suffix):
     config = TypeAdapter(ExpertOffloadConfig).validate_python(
-        {"enabled": False, "dspark_expert_pool": {"enabled": True, "protected_positions": 2, "suffix_experts": 2}}
+        {"enabled": False, "dspark_protected_positions": 2, "dspark_suffix_experts": suffix}
     )
     with pytest.raises(ValueError, match="requires enabled expert offload"):
         validate_expert_offload_config(config, None, None)
 
 
-@pytest.mark.parametrize("protected,suffix", [(None, 2), (0, 2), (7, 2), (2, None), (2, -1), (2, 7)])
-def test_pool_validation_rejects_missing_and_out_of_range_parameters(protected, suffix):
+@pytest.mark.parametrize("protected,suffix", [(None, 0), (None, 2), (2, None)])
+@pytest.mark.parametrize("offload_enabled", [False, True])
+def test_pool_validation_requires_both_parameters_before_any_early_return(protected, suffix, offload_enabled):
+    config = ExpertOffloadConfig(
+        enabled=offload_enabled,
+        num_device_experts=84 if offload_enabled else None,
+        dspark_protected_positions=protected,
+        dspark_suffix_experts=suffix,
+    )
+    with pytest.raises(ValueError, match="dspark_protected_positions and.*dspark_suffix_experts.*together"):
+        validate_expert_offload_config(config, None, None)
+
+
+@pytest.mark.parametrize("protected,suffix", [(0, 2), (7, 2), (2, -1), (2, 7)])
+def test_pool_validation_rejects_out_of_range_parameters(protected, suffix):
     config, vc, ac = make_pool_configs(protected, suffix)
     with pytest.raises(ValueError, match="protected_positions|suffix_experts"):
         validate_expert_offload_config(config, vc, ac)
@@ -159,12 +174,15 @@ def test_pool_validation_requires_dspark_with_positive_draft_tokens(method, draf
 
 
 @pytest.mark.parametrize("offload_enabled", [False, True])
-def test_pool_validation_ignores_disabled_pool_options(offload_enabled):
+@pytest.mark.parametrize("explicit_nulls", [False, True])
+def test_pool_validation_keeps_native_routing_when_parameters_are_omitted(offload_enabled, explicit_nulls):
+    options = {"dspark_protected_positions": None, "dspark_suffix_experts": None} if explicit_nulls else {}
     config = ExpertOffloadConfig(
         enabled=offload_enabled,
         num_device_experts=84 if offload_enabled else None,
-        dspark_expert_pool={"enabled": False, "protected_positions": -1, "suffix_experts": 7},
+        **options,
     )
+    assert config.dspark_protected_positions is None and config.dspark_suffix_experts is None
     validate_expert_offload_config(config, *make_configs())
 
 

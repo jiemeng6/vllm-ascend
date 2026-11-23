@@ -25,9 +25,16 @@ def validate_expert_offload_layer(expert_offload_config: ExpertOffloadConfig, nu
 def validate_expert_offload_config(
     expert_offload_config: ExpertOffloadConfig, vllm_config: VllmConfig, ascend_config: AscendConfig
 ) -> None:
-    pool_config = expert_offload_config.dspark_expert_pool
-    if pool_config.enabled and not expert_offload_config.enabled:
-        raise ValueError("expert_offload_config.dspark_expert_pool requires enabled expert offload")
+    protected_positions = expert_offload_config.dspark_protected_positions
+    suffix_experts = expert_offload_config.dspark_suffix_experts
+    if (protected_positions is None) != (suffix_experts is None):
+        raise ValueError(
+            "expert_offload_config.dspark_protected_positions and "
+            "expert_offload_config.dspark_suffix_experts must be set together"
+        )
+    pool_enabled = protected_positions is not None
+    if pool_enabled and not expert_offload_config.enabled:
+        raise ValueError("DSpark expert-pool routing requires enabled expert offload")
     if not expert_offload_config.enabled:
         return
     if get_current_hardware_profile().device_adaptor_family != DeviceAdaptorFamily.FP8_OPTIMIZED:
@@ -121,7 +128,7 @@ def validate_expert_offload_config(
     if ascend_config.rl_config.enabled:
         raise ValueError("expert offload cannot rebuild prepared host bytes and graphs during RL weight reloading")
 
-    if not pool_config.enabled:
+    if not pool_enabled:
         return
 
     from vllm_ascend.ops.triton.deepseek_expert_pool import TOP_K
@@ -132,9 +139,9 @@ def validate_expert_offload_config(
         else None
     )
     if draft_tokens is None or draft_tokens <= 0:
-        raise ValueError("dspark_expert_pool requires DSpark with a positive number of speculative tokens")
+        raise ValueError("DSpark expert-pool routing requires DSpark with a positive number of speculative tokens")
     verify_width = draft_tokens + 1
-    if pool_config.protected_positions is None or not 1 <= pool_config.protected_positions <= verify_width:
-        raise ValueError(f"dspark_expert_pool.protected_positions must be in [1, {verify_width}]")
-    if pool_config.suffix_experts is None or not 0 <= pool_config.suffix_experts <= TOP_K:
-        raise ValueError(f"dspark_expert_pool.suffix_experts must be in [0, {TOP_K}]")
+    if protected_positions is None or not 1 <= protected_positions <= verify_width:
+        raise ValueError(f"expert_offload_config.dspark_protected_positions must be in [1, {verify_width}]")
+    if suffix_experts is None or not 0 <= suffix_experts <= TOP_K:
+        raise ValueError(f"expert_offload_config.dspark_suffix_experts must be in [0, {TOP_K}]")

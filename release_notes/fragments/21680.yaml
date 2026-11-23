@@ -4,9 +4,10 @@ entries:
     text: >-
       Added optional DSpark expert-pool routing for compatible DeepSeek models
       using ModelRunner V2 and single-device expert offload on Ascend 950 (A5).
-      The feature is disabled by default. To enable it, set
-      `expert_offload_config.dspark_expert_pool.enabled` to `true` under `--additional-config` and
-      provide `protected_positions` and `suffix_experts`.
+      This is a lossy optimization that can change model outputs and accuracy.
+      It is disabled by default; with expert offload enabled, opt in by setting both
+      `expert_offload_config.dspark_protected_positions` and
+      `expert_offload_config.dspark_suffix_experts` under `--additional-config`.
   - category: bugfix
     text: Fixed redundant expert-weight transfers caused by padding rows during ACL Graph replay with expert offload.
   - category: bugfix

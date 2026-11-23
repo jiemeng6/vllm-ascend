@@ -400,8 +400,9 @@ class ExpertOffloadManager:
         for binding in self.bindings.values():
             binding._uses_dspark_expert_pool = False
         offload_config = runner.ascend_config.expert_offload_config
-        pool_config = offload_config.dspark_expert_pool
-        if not pool_config.enabled:
+        protected_positions = offload_config.dspark_protected_positions
+        suffix_experts = offload_config.dspark_suffix_experts
+        if protected_positions is None and suffix_experts is None:
             return
 
         # Import only for enabled pools; router compatibility imports MoE code.
@@ -415,14 +416,14 @@ class ExpertOffloadManager:
         ]
         if not bindings:
             raise ValueError("dspark_expert_pool found no supported target routed expert layer")
-        assert pool_config.protected_positions is not None and pool_config.suffix_experts is not None
+        assert protected_positions is not None and suffix_experts is not None
         assert runner.speculative_config is not None and runner.speculative_config.num_speculative_tokens is not None
         assert offload_config.num_device_experts is not None
         self.dspark_expert_pool = DSparkExpertPool(
             runner.device,
             runner.max_num_tokens,
-            pool_config.protected_positions,
-            pool_config.suffix_experts,
+            protected_positions,
+            suffix_experts,
             num_speculative_tokens=runner.speculative_config.num_speculative_tokens,
             num_device_experts=offload_config.num_device_experts,
         )

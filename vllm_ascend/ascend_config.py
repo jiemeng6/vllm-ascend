@@ -506,21 +506,15 @@ class SharedEngramConfig:
 
 
 @config(config=ConfigDict(frozen=True))
-class DSparkExpertPoolConfig:
-    """Opt-in L routing for the single-device DSpark expert-offload path."""
-
-    enabled: bool = False
-    protected_positions: int | None = None
-    suffix_experts: int | None = None
-
-
-@config(config=ConfigDict(frozen=True))
 class ExpertOffloadConfig:
-    """Configuration for exact single-worker expert offload."""
+    """Single-worker expert offload with optional lossy DSpark routing."""
 
     enabled: bool = False
     num_device_experts: int | None = Field(default=None, gt=0)
-    dspark_expert_pool: DSparkExpertPoolConfig = dataclasses.field(default_factory=DSparkExpertPoolConfig)
+    # Both parameters must be set to opt in; None preserves native routing.
+    # Protected positions include the anchor; suffix experts may be zero.
+    dspark_protected_positions: int | None = None
+    dspark_suffix_experts: int | None = None
 
     @model_validator(mode="after")
     def _validate_capacity(self):
@@ -1952,9 +1946,14 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
 
 def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
-    if "dspark_expert_pool" in additional_config:
+    offload_options = additional_config.get("expert_offload_config")
+    if "dspark_expert_pool" in additional_config or (
+        isinstance(offload_options, dict) and "dspark_expert_pool" in offload_options
+    ):
         raise ValueError(
-            "additional_config.dspark_expert_pool moved to additional_config.expert_offload_config.dspark_expert_pool"
+            "dspark_expert_pool configuration has been replaced by "
+            "expert_offload_config.dspark_protected_positions and "
+            "expert_offload_config.dspark_suffix_experts; set both fields to enable expert-pool routing"
         )
     # Upstream EngineArgs injects --gdn-prefill-backend / --kda-prefill-backend
     # into additional_config. The generic GDN/KDA model layers consume them
