@@ -23,6 +23,7 @@ def test_operator_import_is_independent_of_worker_and_offload(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", import_without_upper_layers)
     spec = importlib.util.spec_from_file_location("isolated_expert_pool", Path(op.__file__))
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
@@ -41,6 +42,7 @@ def test_batch_helpers_import_without_loading_routing_or_pool(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", import_without_routing)
     path = Path(op.__file__).parents[2] / "distributed/expert_transfer/expert_offload_utils.py"
     spec = importlib.util.spec_from_file_location("isolated_offload_helpers", path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
