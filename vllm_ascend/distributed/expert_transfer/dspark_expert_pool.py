@@ -8,11 +8,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-TOP_K = 6
-
-UNRESTRICTED = 0
-CONTRIBUTOR = 1
-RESTRICTED = 2
+from vllm_ascend.ops.triton.deepseek_expert_pool import CONTRIBUTOR, RESTRICTED, TOP_K, UNRESTRICTED, route_experts
 
 
 def build_roles(
@@ -32,20 +28,6 @@ def build_roles(
         roles[start:split] = CONTRIBUTOR
         roles[split:end] = RESTRICTED
     return roles
-
-
-def verify_graph_eligible(batch_state, *, num_speculative_tokens: int, structured: bool) -> bool:
-    rows = batch_state.num_scheduled_tokens
-    drafts = batch_state.num_draft_tokens_np
-    verify_width = num_speculative_tokens + 1
-    return (
-        not structured
-        and drafts is not None
-        and len(rows) == len(drafts) > 0
-        and not any(batch_state.is_prefilling_np)
-        and all(count == num_speculative_tokens for count in drafts)
-        and all(count == verify_width for count in rows)
-    )
 
 
 def supports_router(layer) -> bool:
@@ -123,8 +105,6 @@ class DSparkExpertPool:
         self._prepare(batch, drafts, [False] * batch.num_reqs)
 
     def route(self, router, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm_ascend.ops.triton.deepseek_expert_pool import route_experts
-
         rows, experts = logits.shape
         if rows != self.num_rows or experts != router.num_logical_experts or logits.dtype != torch.float32:
             raise ValueError("DSpark routing requires aligned FP32 logits and one row per prepared token role")

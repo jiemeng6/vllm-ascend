@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import verify_graph_eligible
-
 if TYPE_CHECKING:
     from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
     from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager
@@ -116,6 +114,20 @@ def initialize(runner: NPUModelRunner) -> None:
     from .expert_offload_manager import initialize_expert_offload
 
     initialize_expert_offload(runner)
+
+
+def verify_graph_eligible(batch_state, *, num_speculative_tokens: int, structured: bool) -> bool:
+    rows = batch_state.num_scheduled_tokens
+    drafts = batch_state.num_draft_tokens_np
+    verify_width = num_speculative_tokens + 1
+    return (
+        not structured
+        and drafts is not None
+        and len(rows) == len(drafts) > 0
+        and not any(batch_state.is_prefilling_np)
+        and all(count == num_speculative_tokens for count in drafts)
+        and all(count == verify_width for count in rows)
+    )
 
 
 def prepare_batch(runner: NPUModelRunner, batch_state, uniform_token_count: int | None, scheduler_output) -> int | None:

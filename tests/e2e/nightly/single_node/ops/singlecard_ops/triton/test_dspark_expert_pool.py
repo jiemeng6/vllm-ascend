@@ -10,12 +10,8 @@ import torch
 
 from vllm_ascend.device.device_config import get_ascend_device_type
 from vllm_ascend.device.hardware import AscendDeviceType
-from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import (
-    CONTRIBUTOR,
-    RESTRICTED,
-    TOP_K,
-    DSparkExpertPool,
-)
+from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
+from vllm_ascend.ops.triton.deepseek_expert_pool import CONTRIBUTOR, RESTRICTED, TOP_K, route_experts
 
 DEVICE = "npu"
 SUPPORTED_DEVICES = (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5)
@@ -114,12 +110,15 @@ def test_dspark_pool_routing_matches_reference_and_handles_strides(reqs, suffix_
     bias = torch.randn(EXPERTS, dtype=torch.float32, device=DEVICE) * 0.1
     bias[0] = bias[1] = 0.0
     pool.prepare(_make_batch(list(range(0, rows + 1, 6)), [5] * reqs, rows))
+    unchanged = (strided.clone(), pool.roles.clone(), bias.clone())
     reference = _reference(strided, pool.roles[:rows], bias, suffix_experts, SCALING)
     outs = [pool.route(_router(bias), x) for x in (strided, strided.contiguous())]
     for layout, output in zip(("strided", "contiguous"), outs):
         _assert_routing_matches(f"{rows=} {suffix_experts=} {layout}", output, reference)
     # Strided logits are honoured directly: the kernels index via row/expert strides.
     assert outs[0][0].equal(outs[1][0]) and outs[0][1].equal(outs[1][1])
+    for actual, original in zip((strided, pool.roles, bias), unchanged):
+        assert actual.equal(original)
 
 
 @pytest.mark.skipif(
@@ -158,3 +157,45 @@ def test_dspark_padding_rows_neither_extend_the_pool_nor_get_routed(real, padded
     pool.prepare(_make_batch(boundaries, drafts, real))
     trimmed = pool.route(_router(bias), logits[:real])
     assert fused[0][:real].equal(trimmed[0]) and fused[1][:real].equal(trimmed[1])
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+@pytest.mark.parametrize("drafts,protected,suffix", [(1, 1, 0), (3, 1, TOP_K), (5, 6, 0)])
+def test_public_wrapper_handles_verification_parameter_boundaries(drafts, protected, suffix):
+    torch.manual_seed(19)
+    rows = drafts + 1
+    logits = torch.randn(rows, EXPERTS, dtype=torch.float32, device=DEVICE)
+    roles = torch.full((rows,), RESTRICTED, dtype=torch.int32, device=DEVICE)
+    roles[:protected] = CONTRIBUTOR
+    bias = torch.randn(EXPERTS, dtype=torch.float32, device=DEVICE) * 0.1
+    raw = torch.empty_like(logits)
+    votes = torch.full((EXPERTS,), 123, dtype=torch.int32, device=DEVICE)
+    originals = tuple(tensor.clone() for tensor in (logits, roles, bias))
+    result = route_experts(logits, roles, bias, raw, votes, suffix, SCALING)
+    _assert_routing_matches(
+        f"{drafts=} {protected=} {suffix=}", result, _reference(logits, roles, bias, suffix, SCALING)
+    )
+    for tensor, original in zip((logits, roles, bias), originals):
+        assert tensor.equal(original)
+    assert torch.all(votes < 123)
+    torch.testing.assert_close(raw, torch.sqrt(torch.log(torch.exp(logits) + 1.0)), rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+@pytest.mark.parametrize("experts", [TOP_K, EXPERTS])
+def test_public_wrapper_zero_scores_preserve_ties_and_denominator_floor(experts):
+    logits = torch.full((6, experts), -40.0, dtype=torch.float32, device=DEVICE)
+    roles = torch.tensor([CONTRIBUTOR] * 2 + [RESTRICTED] * 4, dtype=torch.int32, device=DEVICE)
+    bias = torch.zeros(experts, dtype=torch.float32, device=DEVICE)
+    result = route_experts(
+        logits,
+        roles,
+        bias,
+        torch.empty_like(logits),
+        torch.empty(experts, dtype=torch.int32, device=DEVICE),
+        0,
+        SCALING,
+    )
+    _assert_routing_matches(f"zero scores {experts=}", result, _reference(logits, roles, bias, 0, SCALING))
+    assert torch.count_nonzero(result[0]).item() == 0
+    assert result[1].equal(torch.arange(TOP_K, dtype=torch.int32, device=DEVICE).expand(6, -1))

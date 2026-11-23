@@ -14,30 +14,31 @@
   2. `_build_pool` launches one program per row on the vector core (`core_mode="vector"`). Each program loads its row of `logits` (masked to `EXPERTS`), casts to FP32, computes and stores the raw scores into the `raw` scratch, loads its role, and, when the role's vote limit is positive, runs K argmax rounds over `raw + bias` (smallest-ID tie-break, one expert removed per round) and atomically adds one relaxed vote per selected expert.
   3. `_finish_route` launches one program per row. Each program loads its role and the votes (`allowed = votes > 0`), restricts candidates to the pool only for RESTRICTED rows, runs K argmax rounds over `raw + bias` to produce the IDs, gathers the bias-free raw scores of those IDs, L1-normalizes them (denominator clamped at 1e-20), scales, and stores the FP32 weights and int32 IDs.
   The launch boundary orders the two kernels: kernel 2 reads votes only after kernel 1's atomics have completed for the whole batch.
-- **Supported modes**: Triton-Ascend vector-core execution on the Ascend 950 (Atlas A5) family, which the expert-offload configuration enforces at startup, in eager mode and ACL graph capture (compilation mode NONE, `FULL_DECODE_ONLY` decode graphs; persistent scratch buffers keep captured addresses stable). The committed unit test is CPU-only and launches no kernel; NPU operator-level accuracy is exercised by the nightly test at `tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_expert_pool.py`, added in parallel with this operator. Device-by-device validation evidence is recorded there; none is claimed here. Inference only.
+- **Supported modes**: The operator uses Triton-Ascend vector cores and has nightly coverage enabled for Atlas A2, Atlas A3, and 950PR/950DT (A5). Production expert offload currently requires A5; this is a caller configuration restriction, not an operator device specialization. Eager execution and ACL graph capture use the same public wrapper (compilation mode NONE, `FULL_DECODE_ONLY` decode graphs; persistent scratch keeps captured addresses stable). Actual device runs and their source revisions are reported in the PR; test eligibility alone does not establish device validation. Inference only.
 
 ## Parameters
 
 | Parameter | Input/Output/Attribute | Description | Data type | Data format |
 | --- | --- | --- | --- | --- |
-| `logits` | Input | Router logits for the padded routed batch; cast to FP32 inside the kernel | FP32 (enforced by the caller) | 2D `[rows, experts]`, arbitrary strides |
+| `logits` | Input | Router logits for the padded routed batch; no implicit dtype conversion | FP32 (checked by the wrapper and caller) | 2D `[rows, experts]`, strided |
 | `roles` | Input | Per-token role codes: 0 unrestricted, 1 CONTRIBUTOR, 2 RESTRICTED; any other value behaves as 0 | int32 | 1D `[rows]`, contiguous |
 | `bias` | Input | Expert correction bias added to the selection score only; the caller substitutes zeros when the router has none and casts to the logits dtype | FP32 (same as `logits`) | 1D `[experts]`, contiguous |
 | `raw` | Input/Output (scratch) | Raw sqrt-softplus scores written by `_build_pool` and re-read by `_finish_route`; persistent graph workspace sliced to `[rows]` when the batch fits the workspace capacity | FP32 | 2D `[rows, experts]`, contiguous row-major |
 | `votes` | Input/Output (scratch) | Batch pool votes; zeroed by the wrapper on entry, accumulated by `_build_pool` | int32 | 1D `[experts]`, contiguous |
 | `suffix_experts` | Attribute | Number of pool candidates each RESTRICTED row votes for | Python int | Scalar in `[0, 6]` |
-| `scaling` | Attribute | `routed_scaling_factor` applied after weight normalization | Python float | Scalar |
+| `scaling` | Attribute | Finite `routed_scaling_factor` applied after weight normalization | Python float or int | Scalar |
 | `weights` | Output | Renormalized routing weights on the bias-free raw basis, multiplied by `scaling`; freshly allocated by the wrapper | FP32 | 2D `[rows, 6]`, contiguous |
 | `ids` | Output | Selected logical expert IDs; freshly allocated by the wrapper | int32 | 2D `[rows, 6]`, contiguous |
 
 ## Constraints
 
-- The production `DSparkExpertPool.route` entry requires FP32 logits and rejects other dtypes before allocating routing scratch or launching a kernel. The DeepSeek V4 gate already computes FP32 logits; this interface does not implicitly promote FP16 or BF16 inputs.
+- The public `route_experts` wrapper checks tensor shapes, dtypes, layouts and matching devices, requires at least six experts, and validates scalar metadata before mutating scratch or launching a kernel. These checks read metadata only; they do not synchronize or copy device contents. The DeepSeek V4 gate already computes FP32 logits; neither entry point implicitly promotes FP16 or BF16 inputs.
 
-- `logits` must be FP32 and 2D with `experts == router.num_logical_experts` and one row per prepared token role; `DSparkExpertPool.route` raises `ValueError` otherwise. `logits` may carry arbitrary row/expert strides (both are passed to the kernel); every other tensor must be contiguous.
+- `logits` must be FP32 and 2D with `experts >= TOP_K`; every other tensor must be contiguous. Logits may carry arbitrary row/expert strides (both are passed to the kernel). `DSparkExpertPool.route` additionally requires `experts == router.num_logical_experts` and one row per prepared token role. Invalid metadata raises `ValueError`.
 - `roles` must be int32, contiguous, with values in `{0, 1, 2}`. The caller's role construction (`build_roles` with `protected_positions` in `[1, num_speculative_tokens + 1]`) always pairs RESTRICTED rows with CONTRIBUTOR rows, and each CONTRIBUTOR row votes 6 distinct experts, so the pool always holds at least `K` candidates and the emitted IDs stay in `[0, experts)`.
-- `bias` must be a contiguous `[experts]` tensor in the logits dtype. `raw` must be a contiguous FP32 `[rows, experts]` buffer (a leading-dimension slice of a persistent `[workspace_rows, experts]` workspace satisfies this); `votes` must be a contiguous int32 `[experts]` buffer. The wrapper zeroes `votes` per call, so the scratch is reusable across calls but must not be shared by concurrent calls.
-- `K` is fixed at `TOP_K = 6`; the router gate (`supports_router`) additionally requires `scoring_func == "sqrtsoftplus"`, `top_k == 6`, `num_logical_experts >= 6`, renormalization enabled, and no tid2eid/bias_vl/custom routing/grouped-topk or EPLB log2phy mapping. `suffix_experts` is validated at config time to `[0, 6]`.
+- `bias` must be a contiguous `[experts]` tensor in the logits dtype. `raw` must be a contiguous FP32 `[rows, experts]` buffer (a leading-dimension slice of a persistent `[workspace_rows, experts]` workspace satisfies this); `votes` must be a contiguous int32 `[experts]` buffer. All tensors must share a device. Scratch buffers must not alias inputs or each other and must not be shared by concurrent calls. These ownership conditions are the caller's responsibility.
+- For a nonempty batch, the wrapper clears `votes` and overwrites `raw`. An empty batch returns `[0, 6]` outputs without clearing scratch or launching kernels. A malformed call leaves scratch unchanged. This wrapper has no CPU computation fallback.
+- `K` is fixed at `TOP_K = 6`; the router gate (`supports_router`) additionally requires `scoring_func == "sqrtsoftplus"`, `top_k == 6`, `num_logical_experts >= 6`, renormalization enabled, and no tid2eid/bias_vl/custom routing/grouped-topk or EPLB log2phy mapping. `suffix_experts` must be a Python int in `[0, 6]`; it is checked at config time and at the public wrapper. `scaling` must be a finite Python float or int.
 - The softplus is evaluated verbatim as `log(exp(x) + 1.0)` in FP32 with no clamping; logits large enough to overflow FP32 `exp` (roughly `x > 88.7`) produce inf raw scores, exactly as the frozen expression dictates.
 - `EXPERTS`, `BLOCK = next_power_of_2(experts)`, both `logits` strides, `SUFFIX_EXPERTS`, the two role codes, `K`, and `SCALING` are compile-time constants: each distinct `(experts, strides, suffix_experts, scaling)` tuple compiles a separate variant. `rows` only changes the launch grid (`multibuffer=False`). Output staging uses 8 register lanes with stores masked to `K = 6`.
 - Scratch placement: batches with `rows <= min(capacity, num_device_experts // 6)` reuse a persistent per-expert-count workspace (stable addresses for graph capture); larger eager batches allocate fresh contiguous scratch per call.
@@ -53,13 +54,21 @@
 
 ## Test Cases
 
+- Public-wrapper CPU contract: `pytest -sv tests/ut/ops/test_deepseek_expert_pool.py` independently imports the operator while rejecting worker/offload imports. It covers malformed tensor/scalar metadata before scratch mutation, empty batches, strided dispatch, input preservation and intentional scratch mutation. Kernel launches are doubled; this suite does not validate device arithmetic.
 - CPU unit contract (launches no NPU kernel): `pytest -sv tests/ut/distributed/expert_transfer/test_dspark_expert_pool.py` covers role construction, verification graph admission, padding refresh with role-buffer address reuse, pool deactivation on ordinary decode and structured-output steps, native-output preservation outside the verification segment (`merge_native`), and capture-time uniform verify-width roles.
-- NPU nightly accuracy: `pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_expert_pool.py` compares the fused route against the PyTorch reference on 6, 12, and 18 verification rows, contiguous and strided logits, tied scores, suffix candidate counts of 0, 2, and 6, and padding from 6 to 12 or 12 to 16 rows. Expert IDs must match exactly. At least 99% of FP32 weights must satisfy `abs(actual - expected) <= 2**-16 + 2**-10 * abs(expected)`, and the maximum absolute error must be at most 0.01.
+- NPU nightly accuracy compares the fused route against the PyTorch `_reference` in the test file on 6, 12, and 18 verification rows, contiguous and strided logits, tied scores, suffix candidate counts of 0, 2, and 6, and padding from 6 to 12 or 12 to 16 rows. Direct public-wrapper cases add verification widths of 2/4/6, protected-position boundaries of 1 and the full width, input preservation, scratch reuse, and all-zero scores with the minimum six experts or the model's 256 experts. Expert IDs must match exactly. At least 99% of FP32 weights must satisfy `abs(actual - expected) <= 2**-16 + 2**-10 * abs(expected)`, and the maximum absolute error must be at most 0.01.
 
 ```bash
+pytest -sv tests/ut/ops/test_deepseek_expert_pool.py
 pytest -sv tests/ut/distributed/expert_transfer/test_dspark_expert_pool.py
 pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_expert_pool.py
 ```
+
+## Integration boundaries
+
+- `deepseek_expert_pool.py` owns `TOP_K` and the role codes; it imports no worker or offload implementation. Higher layers import the public wrapper and constants, never launch the kernels directly.
+- `distributed/expert_transfer/dspark_expert_pool.py` owns batch roles, router compatibility and reusable scratch. It imports the wrapper at module scope. The offload manager owns the pool lifecycle. Pure graph-admission checks live in `expert_offload_utils.py`, which has no runtime pool dependency; this avoids a cycle through the parent `ops` package's MoE registration.
+- `DSparkExpertPoolConfig` in `ascend_config.py` is a schema. `validate_expert_offload_config()` performs the pool's cross-config checks through the existing `derive_and_validate()` entry. Only enabled-pool validation imports the lower-level `TOP_K`; importing definitions does not launch or compile a kernel.
 
 ## JIT Specialization
 

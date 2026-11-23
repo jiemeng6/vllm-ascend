@@ -3,10 +3,17 @@
 
 """L routing for DeepSeek: form the batch pool, then emit logical IDs and weights."""
 
+import math
+
 import torch
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import CONTRIBUTOR, RESTRICTED, TOP_K
+# This model-specific operator uses DeepSeek's six routed experts per token.
+TOP_K = 6
+
+UNRESTRICTED = 0
+CONTRIBUTOR = 1
+RESTRICTED = 2
 
 
 @triton.jit
@@ -97,7 +104,40 @@ def route_experts(
     suffix_experts: int,
     scaling: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route FP32 logits through a shared pool, overwriting only ``raw`` and ``votes``.
+
+    All tensors must share a device. Logits may be strided; roles, bias and
+    scratch are contiguous. The caller supplies nonaliasing scratch and roles
+    whose votes give every restricted row at least TOP_K candidate experts.
+    Metadata is checked without reading device contents or synchronizing.
+    """
+    if logits.layout != torch.strided or logits.ndim != 2 or logits.dtype != torch.float32:
+        raise ValueError("logits must be a strided 2D FP32 tensor")
     rows, experts = logits.shape
+    if experts < TOP_K:
+        raise ValueError(f"expert-pool routing requires at least {TOP_K} experts")
+    for name, tensor, shape, dtype in (
+        ("roles", roles, (rows,), torch.int32),
+        ("bias", bias, (experts,), torch.float32),
+        ("raw", raw, (rows, experts), torch.float32),
+        ("votes", votes, (experts,), torch.int32),
+    ):
+        if (
+            tensor.layout != torch.strided
+            or tensor.shape != shape
+            or tensor.dtype != dtype
+            or tensor.device != logits.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be contiguous {dtype} with shape {shape} on the logits device")
+    if type(suffix_experts) is not int or not 0 <= suffix_experts <= TOP_K:
+        raise ValueError(f"suffix_experts must be an integer in [0, {TOP_K}]")
+    if type(scaling) not in (int, float) or not math.isfinite(scaling):
+        raise ValueError("scaling must be a finite number")
+    weights = torch.empty((rows, TOP_K), dtype=torch.float32, device=logits.device)
+    ids = torch.empty((rows, TOP_K), dtype=torch.int32, device=logits.device)
+    if rows == 0:
+        return weights, ids
     block = triton.next_power_of_2(experts)
     votes.zero_()
     _build_pool[(rows,)](
@@ -116,8 +156,6 @@ def route_experts(
         TOP_K,
         multibuffer=False,
     )
-    weights = torch.empty((rows, TOP_K), dtype=torch.float32, device=logits.device)
-    ids = torch.empty((rows, TOP_K), dtype=torch.int32, device=logits.device)
     _finish_route[(rows,)](
         raw,
         roles,
