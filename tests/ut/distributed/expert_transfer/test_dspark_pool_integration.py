@@ -57,6 +57,8 @@ def test_schema_rejects_the_removed_nested_pool_key():
 def _make_pool_runner(expert_factory):
     layers = [expert_factory(experts=128, top_k=6, slots=84, layer_name=f"layer.{i}")[0] for i in range(2)]
     router = object.__new__(AscendFusedTopKRouter)
+    if isinstance(router, torch.nn.Module):
+        torch.nn.Module.__init__(router)
     for name, value in {
         "scoring_func": "sqrtsoftplus",
         "top_k": 6,
