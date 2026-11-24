@@ -5,6 +5,7 @@ import builtins
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,7 +47,11 @@ def test_batch_helpers_import_without_loading_routing_or_pool(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    assert callable(module.verify_graph_eligible)
+    runner = SimpleNamespace(model=None)
+    module.before_execute(runner)
+    assert module.prepare_batch(runner, None, 6, None) == 6
+    module.prepare_inputs(runner, None, None)
+    module.prepare_capture(None, None)
     assert callable(module.expert_offload_weights)
 
 

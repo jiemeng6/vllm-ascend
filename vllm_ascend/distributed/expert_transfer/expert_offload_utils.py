@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 if TYPE_CHECKING:
-    from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
     from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager
     from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
     from vllm_ascend.worker.v2.model_runner import NPUModelRunner
@@ -94,11 +93,6 @@ def get_manager(model: torch.nn.Module | None) -> ExpertOffloadManager | None:
     return cast("ExpertOffloadManager | None", getattr(model, "_expert_offload_manager", None))
 
 
-def get_dspark_expert_pool(model: torch.nn.Module | None) -> DSparkExpertPool | None:
-    manager = get_manager(model)
-    return manager.dspark_expert_pool if manager is not None else None
-
-
 def validate_loading(runner: NPUModelRunner, load_dummy_weights: bool) -> None:
     expert_offload_config = getattr(getattr(runner, "ascend_config", None), "expert_offload_config", None)
     if load_dummy_weights and expert_offload_config is not None and expert_offload_config.enabled:
@@ -116,40 +110,25 @@ def initialize(runner: NPUModelRunner) -> None:
     initialize_expert_offload(runner)
 
 
-def verify_graph_eligible(batch_state, *, num_speculative_tokens: int, structured: bool) -> bool:
-    rows = batch_state.num_scheduled_tokens
-    drafts = batch_state.num_draft_tokens_np
-    verify_width = num_speculative_tokens + 1
-    return (
-        not structured
-        and drafts is not None
-        and len(rows) == len(drafts) > 0
-        and not any(batch_state.is_prefilling_np)
-        and all(count == num_speculative_tokens for count in drafts)
-        and all(count == verify_width for count in rows)
-    )
+def before_execute(runner: NPUModelRunner) -> None:
+    if (manager := get_manager(getattr(runner, "model", None))) is not None:
+        manager.before_execute()
 
 
 def prepare_batch(runner: NPUModelRunner, batch_state, uniform_token_count: int | None, scheduler_output) -> int | None:
-    expert_offload_manager = get_manager(getattr(runner, "model", None))
-    if expert_offload_manager is not None:
-        # Dummy batches have no request state and use the full expert pool.
-        expert_offload_manager.has_prefill = batch_state is None or batch_state.has_prefill
-        pool = expert_offload_manager.dspark_expert_pool
-        if (
-            pool is not None
-            and batch_state is not None
-            and uniform_token_count not in (None, 1)
-            and not verify_graph_eligible(
-                batch_state,
-                num_speculative_tokens=pool.num_speculative_tokens,
-                structured=scheduler_output.has_structured_output_requests
-                or bool(scheduler_output.num_invalid_spec_tokens),
-            )
-        ):
-            # Mixed and short verification retain the eager routing path.
-            return None
+    if (manager := get_manager(getattr(runner, "model", None))) is not None:
+        return manager.prepare_batch(batch_state, uniform_token_count, scheduler_output)
     return uniform_token_count
+
+
+def prepare_inputs(runner: NPUModelRunner, input_batch, scheduler_output) -> None:
+    if (manager := get_manager(getattr(runner, "model", None))) is not None:
+        manager.prepare_inputs(input_batch, scheduler_output)
+
+
+def prepare_capture(model: torch.nn.Module | None, input_batch) -> None:
+    if (manager := get_manager(model)) is not None:
+        manager.prepare_capture(input_batch)
 
 
 def prepare_graph_capture(graph_manager: ModelAclGraphManager, needs_capture: Callable[[], bool]) -> None:
@@ -161,6 +140,5 @@ def prepare_graph_capture(graph_manager: ModelAclGraphManager, needs_capture: Ca
 def shutdown(runner: NPUModelRunner) -> None:
     expert_offload_manager = get_manager(getattr(runner, "model", None))
     if expert_offload_manager is not None:
-        expert_offload_manager.unsubscribe_graph_streams()
-        expert_offload_manager.dspark_expert_pool = None
+        expert_offload_manager.shutdown()
         del runner.model._expert_offload_manager

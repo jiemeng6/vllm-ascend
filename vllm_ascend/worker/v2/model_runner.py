@@ -752,8 +752,7 @@ class NPUModelRunner(GPUModelRunner):
         dp_coordination_context = skip_dp_coordination() if skip_dp_metadata_sync else nullcontext()
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
-        if (pool := expert_offload.get_dspark_expert_pool(self.model)) is not None:
-            pool.active = False
+        expert_offload.before_execute(self)
         with dp_coordination_context:
             try:
                 output = super().execute_model(
@@ -1160,8 +1159,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.pcp_manager is not None:
             input_batch = self.pcp_manager.partition_batch(input_batch, batch_desc)
 
-        if (pool := expert_offload.get_dspark_expert_pool(self.model)) is not None:
-            pool.prepare(input_batch, invalid_drafts=bool(scheduler_output.num_invalid_spec_tokens))
+        expert_offload.prepare_inputs(self, input_batch, scheduler_output)
 
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)

@@ -12,7 +12,7 @@ from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import (
     DSparkExpertPool,
     build_roles,
 )
-from vllm_ascend.distributed.expert_transfer.expert_offload_utils import verify_graph_eligible
+from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager
 
 
 @pytest.mark.parametrize(
@@ -55,7 +55,12 @@ def test_verify_graph_dispatch(configured_drafts, rows, drafts, prefilling, stru
     state = SimpleNamespace(
         num_scheduled_tokens=np.array(rows), num_draft_tokens_np=drafts, is_prefilling_np=prefilling
     )
-    assert verify_graph_eligible(state, num_speculative_tokens=configured_drafts, structured=structured) is expected
+    assert (
+        ExpertOffloadManager._verify_graph_eligible(
+            state, num_speculative_tokens=configured_drafts, structured=structured
+        )
+        is expected
+    )
 
 
 def make_batch(boundaries, drafts, padded_rows, *, structured=False):

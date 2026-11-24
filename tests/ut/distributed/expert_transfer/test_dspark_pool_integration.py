@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Expert-pool ownership, configuration and dispatch contracts."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -105,9 +106,7 @@ def test_manager_owns_one_pool_and_only_compatible_bindings_expose_it(expert_fac
     initialize = getattr(manager, "initialize_dspark_expert_pool", None)
     assert callable(initialize), "The offload manager must initialize its shared pool"
     initialize(runner)
-    get_pool = getattr(expert_offload, "get_dspark_expert_pool", None)
-    assert callable(get_pool), "Runner and model-state hooks need one model-owned lookup"
-    pool = get_pool(runner.model)
+    pool = manager.dspark_expert_pool
     assert isinstance(pool, DSparkExpertPool)
     assert pool.protected_positions == 2 and pool.suffix_experts == suffix
     assert pool is manager.dspark_expert_pool
@@ -135,7 +134,7 @@ def test_pool_shutdown_clears_binding_access(expert_factory, native_runtime):
     initialize(runner)
     assert layers[0]._expert_offload_binding.dspark_expert_pool is not None
     expert_offload.shutdown(runner)
-    assert expert_offload.get_dspark_expert_pool(runner.model) is None
+    assert expert_offload.get_manager(runner.model) is None
     assert manager.dspark_expert_pool is None
     assert layers[0]._expert_offload_binding.dspark_expert_pool is None
 
@@ -329,3 +328,81 @@ def test_moe_routing_uses_binding_and_preserves_common_postprocessing(
         native._select_experts.assert_not_called()
     else:
         native._select_experts.assert_called_once_with(hidden_states=hidden, router_logits=logits, input_ids=input_ids)
+
+
+@pytest.mark.parametrize("has_manager", [False, True])
+def test_lifecycle_hooks_reset_and_prepare_roles_without_a_pool_reference(has_manager):
+    manager = ExpertOffloadManager()
+    pool = DSparkExpertPool(torch.device("cpu"), 12, 2, 2, num_speculative_tokens=5, num_device_experts=84)
+    manager.dspark_expert_pool = pool
+    model = torch.nn.Module()
+    if has_manager:
+        model._expert_offload_manager = manager
+    runner = SimpleNamespace(model=model)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=12,
+        num_tokens_after_padding=12,
+        query_start_loc_np=[0, 6, 12],
+        num_draft_tokens_per_req=[5, 5],
+        is_prefilling_np=[False, False],
+        has_structured_output_reqs=False,
+    )
+    scheduled = SimpleNamespace(num_invalid_spec_tokens=0)
+    address = pool.roles.data_ptr()
+    for real_rows in (12, 6, 12):
+        batch.num_tokens = real_rows
+        batch.num_reqs = real_rows // 6
+        batch.num_draft_tokens_per_req = [5] * batch.num_reqs
+        batch.is_prefilling_np = [False] * batch.num_reqs
+        pool.active = True
+        expert_offload.before_execute(runner)
+        assert pool.active is (not has_manager)
+        expert_offload.prepare_capture(model, batch)
+        expert_offload.prepare_inputs(runner, batch, scheduled)
+        if has_manager:
+            assert pool.active
+            assert pool.roles.tolist() == [1, 1, 2, 2, 2, 2] * batch.num_reqs + [0] * (12 - real_rows)
+            assert not pool.has_native_rows
+            assert pool.roles.data_ptr() == address
+    if has_manager:
+        scheduled.num_invalid_spec_tokens = 1
+        expert_offload.prepare_inputs(runner, batch, scheduled)
+        assert not pool.active
+    assert expert_offload.prepare_batch(runner, None, 1, scheduled) == 1
+    assert expert_offload.get_manager(model) is (manager if has_manager else None)
+
+
+def test_execute_clears_stale_pool_before_an_empty_or_failed_parent(load_hook_class):
+    manager = ExpertOffloadManager()
+    pool = SimpleNamespace(active=True)
+    manager.dspark_expert_pool = pool
+
+    class Parent:
+        def execute_model(self, *args, **kwargs):
+            assert not pool.active
+            raise RuntimeError("parent failure after reset")
+
+    runner_class = load_hook_class(
+        "vllm_ascend/worker/v2/model_runner.py",
+        "NPUModelRunner",
+        {"execute_model"},
+        Parent,
+        {
+            "expert_offload": expert_offload,
+            "has_kv_transfer_group": lambda: False,
+            "should_skip_allreduce_across_dp_group": lambda _: False,
+            "nullcontext": nullcontext,
+            "HostMirrorConnector": type("HostMirrorConnector", (), {}),
+        },
+    )
+    runner = runner_class()
+    runner.model = torch.nn.Module()
+    runner.model._expert_offload_manager = manager
+    runner.model_state = SimpleNamespace(finish_execution=Mock())
+    runner.vllm_config = object()
+    scheduled = SimpleNamespace(total_num_scheduled_tokens=0)
+    with pytest.raises(RuntimeError, match="parent failure after reset"):
+        runner.execute_model(scheduled)
+    runner.model_state.finish_execution.assert_called_once_with(failed=True)
+    assert not pool.active

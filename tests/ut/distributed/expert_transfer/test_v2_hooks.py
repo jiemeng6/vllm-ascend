@@ -129,6 +129,7 @@ def test_load_preserves_parent_contract_and_accounts_pool_memory(load_hook_class
     assert runner.model_memory_usage == 1064
     assert runner.pd_dspark_aux_layer_ids == [9]
     manager.unsubscribe_graph_streams.side_effect = lambda: events.append("unsubscribe_reports")
+    manager.shutdown.side_effect = lambda: manager.unsubscribe_graph_streams()
     runner.shutdown()
     assert events[-2:] == ["unsubscribe_reports", "parent_shutdown"]
     assert expert_offload.get_manager(runner.model) is None
@@ -164,7 +165,7 @@ def test_disabled_load_does_not_initialize_offload(load_hook_class, loading_memo
 def test_expert_pool_graph_dispatch_preserves_offload_metadata(
     load_hook_class, rows, drafts, prefilling, structured, invalid, width, expected
 ):
-    manager = Mock()
+    manager = ExpertOffloadManager()
     runner, _ = make_runner(load_hook_class, manager=manager)
     manager.dspark_expert_pool = SimpleNamespace(num_speculative_tokens=5)
     state = SimpleNamespace(
