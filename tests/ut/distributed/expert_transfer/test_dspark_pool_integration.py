@@ -189,7 +189,8 @@ def test_prepare_batch_returns_dispatch_width_without_changing_offload_phase(
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_select_experts_preserves_pure_and_mixed_routing(mixed):
+def test_select_experts_preserves_pure_and_mixed_routing(mixed, monkeypatch):
+    monkeypatch.setattr(manager_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False))
     rows = 7 if mixed else 6
     pool = DSparkExpertPool(torch.device("cpu"), rows, 2, 2, num_speculative_tokens=5, num_device_experts=84)
     pool.prepare(
@@ -249,7 +250,8 @@ def test_binding_preserves_native_fallback(reason, monkeypatch):
     pool.route.assert_not_called()
 
 
-def test_padding_roles_do_not_trigger_native_routing():
+def test_padding_roles_do_not_trigger_native_routing(monkeypatch):
+    monkeypatch.setattr(manager_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False))
     pool = DSparkExpertPool(torch.device("cpu"), 12, 2, 2, num_speculative_tokens=5, num_device_experts=84)
     pool.prepare(
         SimpleNamespace(
@@ -394,6 +396,8 @@ def test_execute_clears_stale_pool_before_an_empty_or_failed_parent(load_hook_cl
             "should_skip_allreduce_across_dp_group": lambda _: False,
             "nullcontext": nullcontext,
             "HostMirrorConnector": type("HostMirrorConnector", (), {}),
+            # This isolated runner owns no delayed-D2H buffers.
+            "d2h_retire": lambda *args: None,
         },
     )
     runner = runner_class()
