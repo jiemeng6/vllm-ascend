@@ -14,9 +14,10 @@ import pytest
 import torch
 
 from vllm_ascend.ascend_config import ExpertOffloadConfig
+from vllm_ascend.distributed.expert_transfer import expert_offload_manager as manager_module
 from vllm_ascend.distributed.expert_transfer import expert_offload_utils as expert_offload
 from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
-from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager
+from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager, LayerOffloadBinding
 from vllm_ascend.distributed.expert_transfer.expert_offload_method import ExpertOffloadMoEMethod
 from vllm_ascend.ops.fused_moe import routed_experts
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
@@ -188,7 +189,7 @@ def test_expert_pool_graph_dispatch_preserves_offload_metadata(
 def test_expert_pool_routing_calls_native_only_for_real_native_rows(
     monkeypatch, active, has_native_rows, capturing, expected
 ):
-    monkeypatch.setattr(routed_experts, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False))
+    monkeypatch.setattr(manager_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False))
     monkeypatch.setattr(routed_experts, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
     monkeypatch.setattr(routed_experts, "get_moe_num_logical_experts", lambda *args, **kwargs: 256)
     monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: capturing)
@@ -202,9 +203,13 @@ def test_expert_pool_routing_calls_native_only_for_real_native_rows(
     pool.active, pool.has_native_rows, pool.num_rows = active, has_native_rows, 2
     pool.roles.copy_(torch.tensor([0, 1] if has_native_rows else [1, 2], dtype=torch.int32))
     pool.route = Mock(return_value=results["pool"])
+    manager = ExpertOffloadManager()
+    manager.dspark_expert_pool = pool
+    binding = object.__new__(LayerOffloadBinding)
+    binding.manager, binding._uses_dspark_expert_pool = manager, True
     layer = SimpleNamespace(
         router=router,
-        _expert_offload_binding=SimpleNamespace(dspark_expert_pool=pool),
+        _expert_offload_binding=binding,
         log2phy=None,
         n_shared_experts=0,
         moe_config=SimpleNamespace(num_experts=256),

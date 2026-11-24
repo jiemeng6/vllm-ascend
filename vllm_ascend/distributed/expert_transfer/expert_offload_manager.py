@@ -11,6 +11,8 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
 from .expert_offload_config import validate_expert_offload_layer
 from .expert_offload_utils import ExpertMapBuffer, ExpertWeightView, PreparedExpertTensor
 from .expert_weight_transfer import TorchExpertTransfer
@@ -169,6 +171,26 @@ class LayerOffloadBinding:
         if self._uses_dspark_expert_pool and self.manager is not None:
             return self.manager.dspark_expert_pool
         return None
+
+    def select_experts(
+        self,
+        *,
+        router,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        enable_force_load_balance: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.manager is None:
+            return router._select_experts(hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids)
+        return self.manager.select_experts(
+            self,
+            router=router,
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
+            enable_force_load_balance=enable_force_load_balance,
+        )
 
     def initialize_storage(self, layer) -> None:
         self.host_store.copy_from_layer(layer, pin_memory=self.device.type == "npu")
@@ -330,6 +352,25 @@ class ExpertOffloadManager:
         self.has_prefill = True
         self.graph_load_stream = None
         self.graph_streams = set()
+
+    def select_experts(
+        self,
+        binding: LayerOffloadBinding,
+        *,
+        router,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        enable_force_load_balance: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pool = binding.dspark_expert_pool
+        if pool is None or not pool.active or enable_force_load_balance or _EXTRA_CTX.is_draft_model:
+            return router._select_experts(hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids)
+        routed = pool.route(router, router_logits)
+        if not pool.has_native_rows:
+            return routed
+        native = router._select_experts(hidden_states=hidden_states, router_logits=router_logits, input_ids=input_ids)
+        return pool.merge_native(routed, native)
 
     def capture_stream(self, _desc):
         # Use the actual NPU stream rather than torch_cuda_wrapper's CUDA cache.

@@ -13,7 +13,7 @@ from vllm_ascend.ascend_config import ExpertOffloadConfig
 from vllm_ascend.distributed.expert_transfer import expert_offload_manager as manager_module
 from vllm_ascend.distributed.expert_transfer import expert_offload_utils as expert_offload
 from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
-from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager
+from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager, LayerOffloadBinding
 from vllm_ascend.ops.fused_moe.router.fused_topk_router import AscendFusedTopKRouter
 
 
@@ -208,10 +208,14 @@ def test_select_experts_preserves_pure_and_mixed_routing(mixed):
     native = (torch.full((rows, 6), 0.5, dtype=torch.bfloat16), torch.full((rows, 6), 23, dtype=torch.int64))
     pool.route = Mock(return_value=pooled)
     router = SimpleNamespace(_select_experts=Mock(return_value=native))
-    select = getattr(pool, "select_experts", None)
-    assert callable(select), "Pool selection must encapsulate the native-row merge"
+    manager = ExpertOffloadManager()
+    manager.dspark_expert_pool = pool
+    binding = object.__new__(LayerOffloadBinding)
+    binding.manager, binding._uses_dspark_expert_pool = manager, True
     hidden, logits = torch.zeros(rows, 4), torch.zeros(rows, 256)
-    weights, ids = select(router, hidden, logits, None)
+    weights, ids = binding.select_experts(
+        router=router, hidden_states=hidden, router_logits=logits, enable_force_load_balance=False
+    )
     if mixed:
         assert weights.dtype == native[0].dtype and ids.dtype == native[1].dtype
         assert weights[:1].equal(native[0][:1]) and ids[:1].equal(native[1][:1])
@@ -219,3 +223,109 @@ def test_select_experts_preserves_pure_and_mixed_routing(mixed):
     else:
         assert weights is pooled[0] and ids is pooled[1]
     assert router._select_experts.call_count == int(mixed)
+    pool.route.assert_called_once_with(router, logits)
+
+
+@pytest.mark.parametrize("reason", ["uninitialized", "incompatible", "inactive", "draft", "force_balance"])
+def test_binding_preserves_native_fallback(reason, monkeypatch):
+    manager = ExpertOffloadManager()
+    pool = SimpleNamespace(active=reason != "inactive", route=Mock())
+    manager.dspark_expert_pool = pool
+    binding = object.__new__(LayerOffloadBinding)
+    binding.manager = None if reason == "uninitialized" else manager
+    binding._uses_dspark_expert_pool = reason != "incompatible"
+    monkeypatch.setattr(manager_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=reason == "draft"), raising=False)
+    native = (torch.full((1, 6), 0.5), torch.arange(6).reshape(1, 6))
+    router = SimpleNamespace(_select_experts=Mock(return_value=native))
+    hidden, logits, input_ids = torch.zeros(1, 4), torch.zeros(1, 256), torch.tensor([17])
+    actual = binding.select_experts(
+        router=router,
+        hidden_states=hidden,
+        router_logits=logits,
+        input_ids=input_ids,
+        enable_force_load_balance=reason == "force_balance",
+    )
+    assert actual is native
+    router._select_experts.assert_called_once_with(hidden_states=hidden, router_logits=logits, input_ids=input_ids)
+    pool.route.assert_not_called()
+
+
+def test_padding_roles_do_not_trigger_native_routing():
+    pool = DSparkExpertPool(torch.device("cpu"), 12, 2, 2, num_speculative_tokens=5, num_device_experts=84)
+    pool.prepare(
+        SimpleNamespace(
+            num_reqs=1,
+            num_tokens=6,
+            num_tokens_after_padding=12,
+            query_start_loc_np=[0, 6],
+            num_draft_tokens_per_req=[5],
+            is_prefilling_np=[False],
+            has_structured_output_reqs=False,
+        )
+    )
+    assert pool.roles.tolist() == [1, 1, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0]
+    manager = ExpertOffloadManager()
+    manager.dspark_expert_pool = pool
+    binding = object.__new__(LayerOffloadBinding)
+    binding.manager, binding._uses_dspark_expert_pool = manager, True
+    pooled = (torch.full((12, 6), 0.25), torch.full((12, 6), 11, dtype=torch.int32))
+    pool.route = Mock(return_value=pooled)
+    router = SimpleNamespace(_select_experts=Mock())
+    actual = binding.select_experts(
+        router=router,
+        hidden_states=torch.zeros(12, 4),
+        router_logits=torch.zeros(12, 256),
+        enable_force_load_balance=False,
+    )
+    assert actual is pooled
+    pool.route.assert_called_once()
+    router._select_experts.assert_not_called()
+
+
+@pytest.mark.parametrize("bound,force_balance", [(False, False), (True, False), (True, True)])
+def test_moe_routing_uses_binding_and_preserves_common_postprocessing(
+    load_hook_class, monkeypatch, bound, force_balance
+):
+    # Load the actual caller method; optional framework imports are outside this CPU contract.
+    moe = load_hook_class(
+        "vllm_ascend/ops/fused_moe/routed_experts.py",
+        "AscendRoutedExperts",
+        {"_select_experts"},
+        object,
+        {
+            "torch": torch,
+            "get_ascend_config": lambda: SimpleNamespace(enable_force_eplb=False),
+            "get_moe_num_logical_experts": lambda *args, **kwargs: 8,
+        },
+    )
+    weights, ids = torch.full((1, 6), 0.5), torch.tensor([[0, 1, 2, 3, 4, 5]])
+    native = SimpleNamespace(_select_experts=Mock(return_value=(weights, ids)))
+    binding = SimpleNamespace(select_experts=Mock(return_value=(weights, ids)))
+    layer = SimpleNamespace(
+        router=native,
+        log2phy=torch.arange(20) + 10,
+        n_shared_experts=0,
+        moe_config=SimpleNamespace(num_experts=8),
+        global_redundant_expert_num=0,
+    )
+    if bound:
+        layer._expert_offload_binding = binding
+    hidden, logits, input_ids = torch.zeros(1, 4), torch.zeros(1, 8), torch.tensor([17])
+    if force_balance:
+        monkeypatch.setattr(
+            torch, "rand", lambda *args, **kwargs: torch.tensor([[7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0]])
+        )
+    actual_weights, actual_ids = moe._select_experts(layer, hidden, logits, force_balance, input_ids)
+    assert actual_weights is weights
+    assert actual_ids.tolist() == ([[7, 6, 5, 4, 3, 2]] if force_balance else [[10, 11, 12, 13, 14, 15]])
+    if bound:
+        binding.select_experts.assert_called_once_with(
+            router=native,
+            hidden_states=hidden,
+            router_logits=logits,
+            input_ids=input_ids,
+            enable_force_load_balance=force_balance,
+        )
+        native._select_experts.assert_not_called()
+    else:
+        native._select_experts.assert_called_once_with(hidden_states=hidden, router_logits=logits, input_ids=input_ids)

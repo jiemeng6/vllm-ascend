@@ -133,23 +133,6 @@ class DSparkExpertPool:
             router.routed_scaling_factor,
         )
 
-    def select_experts(
-        self,
-        router,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        routed = self.route(router, router_logits)
-        if not self.has_native_rows:
-            return routed
-        native = router._select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            input_ids=input_ids,
-        )
-        return self.merge_native(routed, native)
-
     def merge_native(
         self,
         routed: tuple[torch.Tensor, torch.Tensor],
