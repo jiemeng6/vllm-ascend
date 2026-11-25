@@ -14,13 +14,19 @@ from vllm_ascend.ops.triton.deepseek_expert_pool import CONTRIBUTOR, RESTRICTED,
 def build_roles(
     *, query_start_loc, draft_counts, is_prefilling, padded_rows: int, protected_positions: int
 ) -> np.ndarray:
-    roles = np.full(padded_rows, UNRESTRICTED, dtype=np.int32)
+    roles: np.ndarray = np.full(padded_rows, UNRESTRICTED, dtype=np.int32)
     if draft_counts is None:
         return roles
     for req, drafts in enumerate(draft_counts):
-        if not drafts or is_prefilling[req]:
+        if is_prefilling[req]:
             continue
         begin, end = map(int, query_start_loc[req : req + 2])
+        if not drafts:
+            # A real one-token decode already needs these experts. Let it
+            # contribute without allowing padding or unrelated rows to vote.
+            if end - begin == 1:
+                roles[begin:end] = CONTRIBUTOR
+            continue
         start = end - int(drafts) - 1
         if not 0 <= begin <= start < end <= padded_rows:
             raise ValueError("DSpark verification segment exceeds the scheduled query")
@@ -94,7 +100,11 @@ class DSparkExpertPool:
             self.roles[: self.num_rows].copy_(source, non_blocking=True)
 
     def prepare(self, batch, *, invalid_drafts: bool = False) -> None:
-        drafts = None if batch.has_structured_output_reqs or invalid_drafts else batch.num_draft_tokens_per_req
+        drafts = (
+            None
+            if batch.has_prefill or batch.has_structured_output_reqs or invalid_drafts
+            else batch.num_draft_tokens_per_req
+        )
         self._prepare(batch, drafts, batch.is_prefilling_np)
 
     def prepare_capture(self, batch) -> None:
@@ -109,7 +119,7 @@ class DSparkExpertPool:
         if rows != self.num_rows or experts != router.num_logical_experts or logits.dtype != torch.float32:
             raise ValueError("DSpark routing requires aligned FP32 logits and one row per prepared token role")
         if rows > self.workspace_rows:
-            # Large mixed-prefill eager batches can have many shapes.
+            # Large eager decode batches can have many shapes.
             raw_scores = torch.empty_like(logits, memory_format=torch.contiguous_format)
             votes = torch.empty(experts, dtype=torch.int32, device=logits.device)
         else:

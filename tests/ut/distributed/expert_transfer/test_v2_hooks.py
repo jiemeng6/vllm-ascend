@@ -14,10 +14,9 @@ import pytest
 import torch
 
 from vllm_ascend.ascend_config import ExpertOffloadConfig
-from vllm_ascend.distributed.expert_transfer import expert_offload_manager as manager_module
 from vllm_ascend.distributed.expert_transfer import expert_offload_utils as expert_offload
 from vllm_ascend.distributed.expert_transfer.dspark_expert_pool import DSparkExpertPool
-from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager, LayerOffloadBinding
+from vllm_ascend.distributed.expert_transfer.expert_offload_manager import ExpertOffloadManager
 from vllm_ascend.distributed.expert_transfer.expert_offload_method import ExpertOffloadMoEMethod
 from vllm_ascend.ops.fused_moe import routed_experts
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
@@ -167,7 +166,9 @@ def test_expert_pool_graph_dispatch_preserves_offload_metadata(
 ):
     manager = ExpertOffloadManager()
     runner, _ = make_runner(load_hook_class, manager=manager)
-    manager.dspark_expert_pool = SimpleNamespace(num_speculative_tokens=5)
+    manager.dspark_expert_pool = DSparkExpertPool(
+        torch.device("cpu"), 12, 2, 2, num_speculative_tokens=5, num_device_experts=84
+    )
     state = SimpleNamespace(
         num_scheduled_tokens=rows,
         num_draft_tokens_np=drafts,
@@ -181,50 +182,6 @@ def test_expert_pool_graph_dispatch_preserves_offload_metadata(
     assert actual_state is state
     assert actual_width == expected
     assert manager.has_prefill is state.has_prefill
-
-
-@pytest.mark.parametrize(
-    "active,has_native_rows,capturing,expected",
-    [(True, False, True, "pool"), (True, True, False, "mixed"), (False, False, True, "native")],
-)
-def test_expert_pool_routing_calls_native_only_for_real_native_rows(
-    monkeypatch, active, has_native_rows, capturing, expected
-):
-    monkeypatch.setattr(manager_module, "_EXTRA_CTX", SimpleNamespace(is_draft_model=False))
-    monkeypatch.setattr(routed_experts, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
-    monkeypatch.setattr(routed_experts, "get_moe_num_logical_experts", lambda *args, **kwargs: 256)
-    monkeypatch.setattr(torch.npu, "is_current_stream_capturing", lambda: capturing)
-    results = {
-        name: (torch.full((2, 6), float(index)), torch.full((2, 6), index, dtype=torch.int32))
-        for index, name in enumerate(("pool", "native"), start=1)
-    }
-    router = Mock()
-    router._select_experts.return_value = results["native"]
-    pool = DSparkExpertPool(torch.device("cpu"), 2, 2, 2, num_speculative_tokens=5, num_device_experts=12)
-    pool.active, pool.has_native_rows, pool.num_rows = active, has_native_rows, 2
-    pool.roles.copy_(torch.tensor([0, 1] if has_native_rows else [1, 2], dtype=torch.int32))
-    pool.route = Mock(return_value=results["pool"])
-    manager = ExpertOffloadManager()
-    manager.dspark_expert_pool = pool
-    binding = object.__new__(LayerOffloadBinding)
-    binding.manager, binding._uses_dspark_expert_pool = manager, True
-    layer = SimpleNamespace(
-        router=router,
-        _expert_offload_binding=binding,
-        log2phy=None,
-        n_shared_experts=0,
-        moe_config=SimpleNamespace(num_experts=256),
-        global_redundant_expert_num=0,
-    )
-    weights, ids = AscendRoutedExperts._select_experts(layer, torch.zeros(2, 4), torch.zeros(2, 256), False)
-    if expected == "mixed":
-        assert weights[:1].equal(results["native"][0][:1]) and ids[:1].equal(results["native"][1][:1])
-        assert weights[1:].equal(results["pool"][0][1:]) and ids[1:].equal(results["pool"][1][1:])
-    else:
-        assert weights is results[expected][0]
-        assert ids is results[expected][1]
-    assert pool.route.call_count == int(active)
-    assert router._select_experts.call_count == int(not active or has_native_rows)
 
 
 def test_execute_preserves_dummy_pool_and_restores_decode_phase(load_hook_class):

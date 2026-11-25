@@ -37,14 +37,18 @@ def _build_pool(
         expert = tl.arange(0, BLOCK)
         valid = expert < EXPERTS
         x = tl.load(logits_ptr + row * ROW_STRIDE + expert * EXPERT_STRIDE, valid, 0).to(tl.float32)
-        # Preserve the frozen L score rounding, including its effect on ties.
-        raw = tl.sqrt(tl.log(tl.exp(x) + 1.0))
+        # Above 20 softplus rounds to x in FP32. Bound exp even in the
+        # unselected branch, while preserving small-score rounding and ties.
+        SOFTPLUS_THRESHOLD: tl.constexpr = 20.0
+        exp_input = tl.where(x > SOFTPLUS_THRESHOLD, SOFTPLUS_THRESHOLD, x)
+        softplus = tl.where(x > SOFTPLUS_THRESHOLD, x, tl.log(tl.exp(exp_input) + 1.0))
+        raw = tl.sqrt(softplus)
         tl.store(raw_scores_ptr + row * EXPERTS + expert, raw, valid)
         role = tl.load(roles_ptr + row)
         limit = tl.where(role == CONTRIBUTOR_ROLE, K, tl.where(role == RESTRICTED_ROLE, SUFFIX_EXPERTS, 0))
         if limit > 0:
             score = raw + tl.load(bias_ptr + expert, valid, 0.0)
-            remaining = valid
+            remaining = valid & (tl.abs(score) < float("inf"))
             selected = tl.full((BLOCK,), False, tl.int1)
             for i in tl.static_range(K):
                 best = tl.max(tl.where(remaining, score, -float("inf")), 0)
@@ -77,7 +81,7 @@ def _finish_route(
         allowed = tl.load(votes_ptr + expert, valid, 0) > 0
         raw = tl.load(raw_scores_ptr + row * EXPERTS + expert, valid, 0.0)
         score = raw + tl.load(bias_ptr + expert, valid, 0.0)
-        remaining = valid & ((role != RESTRICTED_ROLE) | allowed)
+        remaining = valid & (tl.abs(score) < float("inf")) & ((role != RESTRICTED_ROLE) | allowed)
         # Triton vectors need power-of-two extents; only the first K lanes are stored.
         OUTPUT_BLOCK: tl.constexpr = triton.next_power_of_2(K)
         out = tl.arange(0, OUTPUT_BLOCK)
@@ -87,11 +91,14 @@ def _finish_route(
             picked = tl.min(tl.where(remaining & (score == best), expert, BLOCK), 0)
             ids = tl.where(out == i, picked, ids)
             remaining = remaining & (expert != picked)
-        weights = tl.where(out < K, tl.gather(raw, ids, axis=0), 0.0)
+        # Check all output slots once, outside the unrolled selection loop.
+        selected = (out < K) & (ids < EXPERTS)
+        safe_ids = tl.where(selected, ids, 0)
+        weights = tl.where(selected, tl.gather(raw, safe_ids, axis=0), 0.0)
         # Preserve the reference denominator floor when selected raw scores sum to zero.
         NORMALIZATION_EPS: tl.constexpr = 1e-20
         denom = tl.maximum(tl.sum(weights, 0), NORMALIZATION_EPS)
-        tl.store(ids_ptr + row * K + out, ids, out < K)
+        tl.store(ids_ptr + row * K + out, safe_ids, out < K)
         tl.store(weights_ptr + row * K + out, weights / denom * SCALING, out < K)
 
 

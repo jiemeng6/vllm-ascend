@@ -643,21 +643,11 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.router is None:
             raise RuntimeError("AscendRoutedExperts requires a router for expert selection.")
-        binding = getattr(self, "_expert_offload_binding", None)
-        if binding is not None:
-            topk_weights, topk_ids = binding.select_experts(
-                router=self.router,
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-                enable_force_load_balance=enable_force_load_balance,
-            )
-        else:
-            topk_weights, topk_ids = self.router._select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                input_ids=input_ids,
-            )
+        topk_weights, topk_ids = self.router._select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
+        )
         if self.log2phy is not None:
             topk_ids = self.log2phy[topk_ids]
 

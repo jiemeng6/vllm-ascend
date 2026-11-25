@@ -45,27 +45,35 @@ def _assert_routing_matches(name, actual, expected):
 def _reference(logits, roles, bias, suffix_experts, scaling):
     """Pure-torch twin of _build_pool/_finish_route: identical ties and normalization.
 
-    Selection ranks raw + bias (raw = sqrt(log(exp(x) + 1))) and breaks ties on the
+    Selection ranks raw + bias (raw = sqrt(softplus(x))) and breaks ties on the
     lowest expert id. Pool votes: contributors add their top-K, restricted rows their
     top-`suffix_experts`, role-0 rows nothing. Final routing ranks the pooled experts
     for restricted rows (for other rows ranking all experts is equivalent, since a
     contributor's own votes always sit inside the pool). Weights renormalize the RAW
     (unbiased) scores: weight[i] = raw(id[i]) / max(sum_j raw(id[j]), 1e-20) * scaling.
     """
-    raw = torch.sqrt(torch.log(torch.exp(logits.float()) + 1.0))
-    order = torch.sort(raw + bias.float(), dim=1, descending=True, stable=True).indices
+    x = logits.float()
+    # Preserve the original small-score rounding; the large-score branch is stable.
+    raw = torch.where(x > 20.0, x, torch.log(torch.exp(x.clamp_max(20.0)) + 1.0)).sqrt()
+    score = raw + bias.float()
+    valid = torch.isfinite(raw) & torch.isfinite(score)
+    order = torch.sort(score.masked_fill(~valid, -float("inf")), dim=1, descending=True, stable=True).indices
     vote_limits = {CONTRIBUTOR: TOP_K, RESTRICTED: suffix_experts}
     pool = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
     for row, role in enumerate(roles.tolist()):
         if vote_limits.get(role):
-            pool[order[row, : vote_limits[role]]] = True
-    ids = torch.empty((logits.shape[0], TOP_K), dtype=torch.int64, device=logits.device)
-    weights = torch.empty_like(ids, dtype=torch.float32)
+            eligible = order[row][valid[row, order[row]]]
+            pool[eligible[: vote_limits[role]]] = True
+    ids = torch.zeros((logits.shape[0], TOP_K), dtype=torch.int64, device=logits.device)
+    weights = torch.zeros_like(ids, dtype=torch.float32)
     for row, role in enumerate(roles.tolist()):
-        ranked = order[row][pool[order[row]]] if role == RESTRICTED else order[row]
-        ids[row] = ranked[:TOP_K]
-        top = raw[row, ranked[:TOP_K]]
-        weights[row] = top / top.sum().clamp_min(1e-20) * scaling
+        ranked = order[row][valid[row, order[row]]]
+        if role == RESTRICTED:
+            ranked = ranked[pool[ranked]]
+        chosen = ranked[:TOP_K]
+        ids[row, : chosen.numel()] = chosen
+        top = raw[row, chosen]
+        weights[row, : chosen.numel()] = top / top.sum().clamp_min(1e-20) * scaling
     return weights, ids.to(torch.int32)
 
 
@@ -89,6 +97,7 @@ def _make_batch(boundaries, drafts, padded_rows):
         num_draft_tokens_per_req=drafts,
         is_prefilling_np=[False] * (len(boundaries) - 1),
         has_structured_output_reqs=False,
+        has_prefill=False,
     )
 
 
@@ -199,3 +208,132 @@ def test_public_wrapper_zero_scores_preserve_ties_and_denominator_floor(experts)
     _assert_routing_matches(f"zero scores {experts=}", result, _reference(logits, roles, bias, 0, SCALING))
     assert torch.count_nonzero(result[0]).item() == 0
     assert result[1].equal(torch.arange(TOP_K, dtype=torch.int32, device=DEVICE).expand(6, -1))
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+@pytest.mark.parametrize("experts", [7, EXPERTS])
+@pytest.mark.parametrize("logit", [100.0, 1000.0, 3e38])
+def test_large_finite_logits_produce_finite_normalized_weights(experts, logit):
+    logits = torch.full((2, experts), logit, dtype=torch.float32, device=DEVICE)
+    roles = torch.tensor([CONTRIBUTOR, RESTRICTED], dtype=torch.int32, device=DEVICE)
+    result = route_experts(
+        logits,
+        roles,
+        torch.zeros(experts, device=DEVICE),
+        torch.empty_like(logits),
+        torch.empty(experts, dtype=torch.int32, device=DEVICE),
+        0,
+        SCALING,
+    )
+    expected = (
+        torch.full((2, TOP_K), SCALING / TOP_K, dtype=torch.float32, device=DEVICE),
+        torch.arange(TOP_K, dtype=torch.int32, device=DEVICE).expand(2, -1),
+    )
+    _assert_routing_matches(f"overflow {experts=} {logit=}", result, expected)
+    assert torch.isfinite(result[0]).all()
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+@pytest.mark.parametrize("experts", [TOP_K, 7, EXPERTS])
+@pytest.mark.parametrize("suffix", [0, 1])
+def test_insufficient_pool_uses_safe_ids_and_zero_weight_for_missing_slots(experts, suffix):
+    # Deliberately violate the production caller's P>=1 precondition to test safety.
+    logits = torch.full((3, experts), -40.0, dtype=torch.float32, device=DEVICE)
+    for row in range(3):
+        logits[row, row + 1] = 4.0
+    roles = torch.full((3,), RESTRICTED, dtype=torch.int32, device=DEVICE)
+    bias = torch.zeros(experts, device=DEVICE)
+    result = route_experts(
+        logits,
+        roles,
+        bias,
+        torch.empty_like(logits),
+        torch.empty(experts, dtype=torch.int32, device=DEVICE),
+        suffix,
+        SCALING,
+    )
+    _assert_routing_matches(
+        f"undersized {experts=} {suffix=}", result, _reference(logits, roles, bias, suffix, SCALING)
+    )
+    weights, ids = result
+    assert torch.isfinite(weights).all() and torch.all((ids >= 0) & (ids < experts))
+    if suffix:
+        assert torch.all(ids[:, 3:] == 0) and torch.all(weights[:, 3:] == 0)
+    else:
+        assert torch.count_nonzero(weights).item() == 0 and torch.count_nonzero(ids).item() == 0
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+@pytest.mark.parametrize("experts", [7, EXPERTS])
+@pytest.mark.parametrize("invalid", ["logit", "bias", "row", "infinite_logit", "infinite_bias"])
+def test_nan_scores_do_not_create_invalid_ids_or_weights(experts, invalid):
+    logits = torch.arange(experts, dtype=torch.float32, device=DEVICE).repeat(3, 1) / experts
+    roles = torch.tensor([CONTRIBUTOR, CONTRIBUTOR, RESTRICTED], dtype=torch.int32, device=DEVICE)
+    bias = torch.zeros(experts, device=DEVICE)
+    if invalid == "bias":
+        bias[3] = float("nan")
+    elif invalid == "row":
+        logits[2] = float("nan")
+    elif invalid == "infinite_logit":
+        logits[:, 3], logits[:, 4] = float("inf"), -float("inf")
+    elif invalid == "infinite_bias":
+        bias[3], bias[4] = float("inf"), -float("inf")
+    else:
+        logits[:, 3] = float("nan")
+    result = route_experts(
+        logits,
+        roles,
+        bias,
+        torch.empty_like(logits),
+        torch.empty(experts, dtype=torch.int32, device=DEVICE),
+        2,
+        SCALING,
+    )
+    _assert_routing_matches(f"NaN {experts=} {invalid=}", result, _reference(logits, roles, bias, 2, SCALING))
+    assert torch.isfinite(result[0]).all() and torch.all((result[1] >= 0) & (result[1] < experts))
+    if invalid == "row":
+        assert torch.count_nonzero(result[0][2]).item() == 0
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+def test_mixed_large_and_small_logits_match_high_precision_weights():
+    logits = torch.tensor(
+        [[-40.0, -1.0, 0.0, 20.0, 21.0, 100.0, 1000.0], [100.0, 23.0, 21.0, -0.5, -2.0, -40.0, 1000.0]],
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    roles = torch.tensor([CONTRIBUTOR, RESTRICTED], dtype=torch.int32, device=DEVICE)
+    result = route_experts(
+        logits,
+        roles,
+        torch.zeros(7, device=DEVICE),
+        torch.empty_like(logits),
+        torch.empty(7, dtype=torch.int32, device=DEVICE),
+        0,
+        SCALING,
+    )
+    # Hand-selected IDs: the contributor excludes expert 0, so the restricted
+    # row cannot choose expert 0 even though its own logit there is 100.
+    ids = torch.tensor([[6, 5, 4, 3, 2, 1], [6, 1, 2, 3, 4, 5]], dtype=torch.int32, device=DEVICE)
+    raw = torch.nn.functional.softplus(logits.cpu().double()).sqrt()
+    top = raw.gather(1, ids.cpu().long())
+    weights = (top / top.sum(dim=1, keepdim=True) * SCALING).float()
+    _assert_routing_matches("mixed large/small high-precision", result, (weights, ids))
+
+
+@pytest.mark.skipif(get_ascend_device_type() not in SUPPORTED_DEVICES, reason="Requires Ascend A2/A3/A5")
+def test_real_zero_draft_decode_contributes_but_padding_does_not():
+    pool = _make_pool(12, suffix_experts=0)
+    pool.prepare(_make_batch([0, 1, 7], [0, 5], 12))
+    assert pool.roles.tolist() == [CONTRIBUTOR] * 3 + [RESTRICTED] * 4 + [0] * 5
+    assert not pool.has_native_rows
+    logits = torch.full((12, EXPERTS), -40.0, dtype=torch.float32, device=DEVICE)
+    logits[0, [90, 91, 92, 93, 94, 99]] = 5.0
+    logits[1:7, 1:7] = 4.0
+    logits[3:7, 99] = 6.0
+    logits[7:, 200:206] = 20.0
+    bias = torch.zeros(EXPERTS, device=DEVICE)
+    result = pool.route(_router(bias), logits)
+    _assert_routing_matches("real decode contribution", result, _reference(logits, pool.roles, bias, 0, SCALING))
+    assert torch.all(result[1][3:7, 0] == 99)
+    assert all(200 not in row for row in result[1][:7].tolist())

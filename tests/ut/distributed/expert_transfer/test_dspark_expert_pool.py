@@ -24,6 +24,7 @@ from vllm_ascend.distributed.expert_transfer.expert_offload_manager import Exper
         ([0, 6, 12], [5, 5], [True, False], 12, [0] * 6 + [1, 1, 2, 2, 2, 2]),
         ([0, 2, 6], [1, 3], [False, False], 6, [1, 1, 1, 1, 2, 2]),
         ([0, 1], None, [False], 1, [0]),
+        ([0, 1, 7], [0, 5], [False, False], 12, [1, 1, 1, 2, 2, 2, 2] + [0] * 5),
     ],
 )
 def test_roles_follow_real_requests(boundaries, drafts, prefilling, padded_rows, expected):
@@ -72,6 +73,7 @@ def make_batch(boundaries, drafts, padded_rows, *, structured=False):
         num_draft_tokens_per_req=drafts,
         is_prefilling_np=[False] * (len(boundaries) - 1),
         has_structured_output_reqs=structured,
+        has_prefill=False,
     )
 
 
@@ -109,6 +111,24 @@ def test_structured_step_clears_active_routing():
     assert not pool.active
 
 
+def test_prefill_step_disables_pool_then_decode_restores_current_roles():
+    pool = DSparkExpertPool(torch.device("cpu"), 12, 2, 2, num_speculative_tokens=5, num_device_experts=84)
+    batch = make_batch([0, 1, 7], [0, 5], 12)
+    pool.prepare(batch)
+    assert pool.active
+    address = pool.roles.data_ptr()
+    batch.has_prefill = True
+    batch.is_prefilling_np = [True, False]
+    pool.prepare(batch)
+    assert not pool.active and not pool.has_native_rows
+    batch.has_prefill = False
+    batch.is_prefilling_np = [False, False]
+    pool.prepare(batch)
+    assert pool.active and not pool.has_native_rows
+    assert pool.roles.data_ptr() == address
+    assert pool.roles.tolist() == [1, 1, 1, 2, 2, 2, 2] + [0] * 5
+
+
 def test_mixed_step_preserves_native_outputs_only_outside_verification():
     pool = DSparkExpertPool(
         torch.device("cpu"),
@@ -118,7 +138,8 @@ def test_mixed_step_preserves_native_outputs_only_outside_verification():
         num_speculative_tokens=5,
         num_device_experts=84,
     )
-    pool.prepare(make_batch([0, 1, 7], [0, 5], 7))
+    # A real row before the eligible verification suffix keeps native routing.
+    pool.prepare(make_batch([0, 7], [5], 7))
     native = (torch.full((7, 6), 0.25), torch.full((7, 6), 17, dtype=torch.int32))
     fused = (torch.full((7, 6), 0.75), torch.full((7, 6), 3, dtype=torch.int32))
     weights, ids = pool.merge_native(fused, native)
