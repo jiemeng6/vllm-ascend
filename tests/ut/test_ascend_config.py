@@ -19,11 +19,12 @@ import math
 import os
 import subprocess
 import sys
+from copy import copy
 from importlib.util import find_spec as real_find_spec
 from statistics import NormalDist
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import PropertyMock, patch
+from unittest.mock import patch
 
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
@@ -48,6 +49,7 @@ from vllm_ascend.ascend_config import (
     ShortRequestFirstConfig,
     SparseKVOffloadConfig,
     clear_ascend_config,
+    draft_config_context,
     get_ascend_config,
     init_ascend_config,
     is_mega_moe_supported,
@@ -55,20 +57,6 @@ from vllm_ascend.ascend_config import (
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.utils import clear_enable_sp, enable_sp, shared_expert_dp_enabled
-
-
-def test_shared_engram_requires_v2_runner():
-    config = AscendConfig(
-        shared_engram={"backend": "a3", "endpoint": "127.0.0.1:29500"},
-        sparse_kv_offload_config=SparseKVOffloadConfig(),
-    )
-    vc = SimpleNamespace(use_v2_model_runner=False, engram_config=SimpleNamespace(cpu_offload=True))
-    try:
-        config.derive_and_validate(vc)
-    except ValueError as exc:
-        assert "Model Runner V2" in str(exc)
-    else:
-        raise AssertionError("V1 must reject shared Engram")
 
 
 def test_shared_engram_config_schema():
@@ -1185,7 +1173,6 @@ class TestSparseKVOffloadConfig(TestBase):
                 pipeline_parallel_size=1,
             ),
             kv_transfer_config=KVTransferConfig(kv_connector="SfaRemoteD2HConnector", kv_role="kv_consumer"),
-            use_v2_model_runner=False,
         )
 
         config = SparseKVOffloadConfig.from_additional_config(
@@ -1214,7 +1201,6 @@ class TestSparseKVOffloadConfig(TestBase):
                 pipeline_parallel_size=1,
             ),
             kv_transfer_config=KVTransferConfig(kv_connector="SfaRemoteD2HConnector", kv_role="kv_consumer"),
-            use_v2_model_runner=True,
             speculative_config=None,
         )
 
@@ -1236,7 +1222,6 @@ class TestSparseKVOffloadConfig(TestBase):
                 pipeline_parallel_size=1,
             ),
             kv_transfer_config=KVTransferConfig(kv_connector="SfaRemoteD2HConnector", kv_role="kv_consumer"),
-            use_v2_model_runner=True,
             speculative_config=None,
         )
         fused = SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True, "topk_buffer_size": 4096})
@@ -1255,7 +1240,7 @@ class TestSparseKVOffloadConfig(TestBase):
         )
         self.assertTrue(fused_mtp2.use_fused_copy_sfa)
 
-    def test_remote_dspark_requires_v2_but_does_not_restrict_mtp(self):
+    def test_remote_dspark_does_not_restrict_fused_copy(self):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=2048)),
             parallel_config=SimpleNamespace(
@@ -1264,18 +1249,8 @@ class TestSparseKVOffloadConfig(TestBase):
                 pipeline_parallel_size=1,
             ),
             kv_transfer_config=KVTransferConfig(kv_connector="SfaRemoteD2HConnector", kv_role="kv_consumer"),
-            use_v2_model_runner=False,
             speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=3),
         )
-        with self.assertRaisesRegex(ValueError, "V2 remote prompt-context initialization"):
-            SparseKVOffloadConfig.from_additional_config(
-                vllm_config,
-                {"enabled": True, "topk_buffer_size": 8192},
-            )
-
-        with self.assertRaisesRegex(ValueError, "V2 remote prompt-context initialization"):
-            SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
-        vllm_config.use_v2_model_runner = True
         fused = SparseKVOffloadConfig.from_additional_config(
             vllm_config,
             {"enabled": True, "topk_buffer_size": 8192},
@@ -1283,7 +1258,6 @@ class TestSparseKVOffloadConfig(TestBase):
         self.assertTrue(fused.use_fused_copy_sfa)
         config = SparseKVOffloadConfig.from_additional_config(vllm_config, {"enabled": True})
         self.assertTrue(config.use_fused_copy_sfa)
-        vllm_config.use_v2_model_runner = False
         vllm_config.speculative_config.method = "mtp"
         config = SparseKVOffloadConfig.from_additional_config(
             vllm_config,
@@ -1955,7 +1929,7 @@ class TestTopLevelSwitchTypeValidation(TestBase):
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_fused_mc2_rolls_back_even_when_config_supported(self, mock_fix, mock_megamoe_supported):
         # After the megamoe op rollback (#15267), enable_fused_mc2=1 short-circuits
-        # _MEGA_MOE_SUPPORTED to False in _validate_user_input_ranges, regardless
+        # the published MegaMoE flag to False, regardless
         # of whether the model config supports megamoe. So even when
         # _is_megamoe_supported_by_config() is True, is_mega_moe_supported() ends
         # up False and the fused path routes to dispatch_ffn_combine instead of
@@ -1968,6 +1942,52 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         # The rollback forces _MEGA_MOE_SUPPORTED=False, so the fused path
         # routes to dispatch_ffn_combine instead of mega_moe.
         self.assertFalse(is_mega_moe_supported())
+
+    @_clean_up
+    @patch("vllm_ascend.ascend_config._MEGA_MOE_SUPPORTED", None)
+    @patch.object(AscendConfig, "_is_megamoe_supported_by_config", return_value=True)
+    @patch(
+        "vllm_ascend.ascend_config.importlib.util.find_spec",
+        side_effect=lambda name, *args: object() if name == "cann_ops_transformer" else real_find_spec(name, *args),
+    )
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_fused_mc2_falls_back_for_per_layer_swiglu_limit(self, mock_fix, mock_find_spec, mock_megamoe_config):
+        # A target or draft model with per-layer limits takes the regular path
+        # and keeps the requested overlap, including when MegaMoe is available.
+        for fused_mc2, target_limits, draft_limits, expected in (
+            (1, [0, 4], None, (0, True, False)),
+            (1, [0, None], [0, 4], (0, True, False)),
+            (1, [0, None], None, (1, False, False)),
+            (2, [0, 4], None, (0, True, False)),
+            (2, [0, None], [0, 4], (0, True, False)),
+            (2, [0, None], None, (1, False, True)),
+            (2, None, None, (1, False, True)),
+            (2, [], None, (1, False, True)),
+            (3, [0, 4], None, (0, True, False)),
+        ):
+            with self.subTest(fused_mc2=fused_mc2, target_limits=target_limits, draft_limits=draft_limits):
+                clear_ascend_config()
+                vc = VllmConfig()
+                vc.additional_config = {"enable_fused_mc2": fused_mc2, "multistream_overlap_shared_expert": True}
+                vc.model_config.hf_text_config = SimpleNamespace(expert_swiglu_limit_list=target_limits)
+                if draft_limits is not None:
+                    draft_text_config = SimpleNamespace(expert_swiglu_limit_list=draft_limits)
+                    vc.speculative_config = SimpleNamespace(
+                        method="mtp",
+                        num_speculative_tokens=1,
+                        draft_model_config=SimpleNamespace(hf_text_config=draft_text_config),
+                    )
+
+                device_type = AscendDeviceType.A5 if fused_mc2 == 3 else AscendDeviceType.A3
+                with patch(
+                    "vllm_ascend.ascend_config.get_current_hardware_profile",
+                    return_value=get_hardware_profile(device_type),
+                ):
+                    config = init_ascend_config(vc)
+
+                actual = (config.enable_fused_mc2, config.multistream_overlap_shared_expert, is_mega_moe_supported())
+                self.assertEqual(actual, expected)
+                self.assertFalse(config.megamoe_shared_expert_fusion)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -2006,37 +2026,39 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_minimax_m3_derivation_initializes_unknown_megamoe_support(self, mock_fix):
+    def test_minimax_m3_draft_validates_its_own_mc2_mode(self, mock_fix):
         vc = VllmConfig()
         vc.model_config.architectures = ["MiniMaxM3SparseForCausalLM"]
-        config = init_ascend_config(vc)
-        # Exercise a custom entry point with normalized MC2 mode and an
-        # uninitialized capability cache, outside the usual factory ordering.
-        config.enable_fused_mc2 = 1
+        vc.parallel_config.world_size = 8
+        vc.additional_config = {"enable_fused_mc2": 2}
+
         with (
-            patch("vllm_ascend.ascend_config._MEGA_MOE_SUPPORTED", None),
             patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=object()),
             patch.object(AscendConfig, "_is_megamoe_supported_by_config", return_value=True),
+            patch("vllm_ascend.ascend_config._MEGA_MOE_SUPPORTED", None),
         ):
-            config.derive_and_validate(vc)
-            self.assertEqual(config.enable_fused_mc2, 1)
+            target = init_ascend_config(vc)
             self.assertTrue(is_mega_moe_supported())
+            draft_vc = copy(vc)
+            draft_vc.additional_config = {"enable_fused_mc2": 1}
 
-        # An explicitly disabled cache must stay disabled even with CANN
-        # installed: MiniMax cannot use dispatch_ffn_combine.
-        with (
-            patch("vllm_ascend.ascend_config._MEGA_MOE_SUPPORTED", False),
-            patch("vllm_ascend.ascend_config.importlib.util.find_spec", return_value=object()),
-            self.assertRaisesRegex(AssertionError, "MiniMax M3 does not support enable_fused_mc2=1"),
-        ):
-            config.derive_and_validate(vc)
+            with (
+                draft_config_context(),
+                self.assertRaisesRegex(AssertionError, "MiniMax M3 does not support enable_fused_mc2=1"),
+            ):
+                init_ascend_config(draft_vc)
+
+            self.assertIs(get_ascend_config(), target)
+            self.assertTrue(is_mega_moe_supported())
 
     @_clean_up
     @patch(
         "vllm_ascend.ascend_config.get_current_hardware_profile",
         return_value=get_hardware_profile(AscendDeviceType.A3),
     )
-    def test_fused_mc2_mode_3_rejects_a3(self, _mock_profile):
+    def test_fused_mc2_mode_3_allows_a3_int8(self, _mock_profile):
+        # A3 (arch22) supports the INT8 shared-expert fusion path, so mode 3
+        # must pass validation on A3 as well.
         config = AscendConfig(
             sparse_kv_offload_config=SimpleNamespace(enabled=False),
             enable_fused_mc2=3,
@@ -2045,8 +2067,7 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(hf_text_config=SimpleNamespace(hidden_size=4096)),
         )
-        with self.assertRaisesRegex(NotImplementedError, "only supported on A5"):
-            config._validate_megamoe_shared_expert_fusion(vllm_config)
+        config._validate_megamoe_shared_expert_fusion(vllm_config)
 
     @_clean_up
     @patch(
@@ -2470,7 +2491,6 @@ class TestKVPPConfig(TestBase):
         for section, field, value, message in restrictions:
             with self.subTest(field=field):
                 config = make_kvpp_config()
-                config.use_v2_model_runner = True
                 setattr(getattr(config, section) if section else config, field, value)
                 # Reach KVPP validation through the real platform entry point.
                 with self.assertRaisesRegex(ValueError, message):
@@ -2505,20 +2525,16 @@ class TestEngramSharedMemoryDefaults(TestBase):
             (1, 2, True),
             (2, 4, True),
         )
-        for use_v2 in (False, True):
-            for dp, pcp, auto_shared in topologies:
-                for shared in (False, True):
-                    with self.subTest(use_v2=use_v2, dp=dp, pcp=pcp, shared=shared):
-                        config = VllmConfig(device_config=DeviceConfig(device="cpu"))
-                        config.parallel_config.data_parallel_size = dp
-                        config.parallel_config.prefill_context_parallel_size = pcp
-                        config.engram_config = SimpleNamespace(cpu_offload=True, dp_shared_memory=shared)
-                        ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig())
-                        with patch.object(
-                            _VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=use_v2
-                        ):
-                            ascend_config.derive_and_validate(config)
-                        self.assertEqual(config.engram_config.dp_shared_memory, shared or (use_v2 and auto_shared))
+        for dp, pcp, auto_shared in topologies:
+            for shared in (False, True):
+                with self.subTest(dp=dp, pcp=pcp, shared=shared):
+                    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+                    config.parallel_config.data_parallel_size = dp
+                    config.parallel_config.prefill_context_parallel_size = pcp
+                    config.engram_config = SimpleNamespace(cpu_offload=True, dp_shared_memory=shared)
+                    ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig())
+                    ascend_config.derive_and_validate(config)
+                    self.assertEqual(config.engram_config.dp_shared_memory, shared or auto_shared)
 
     def test_dp_shared_memory_not_set_when_cpu_offload_false(self):
         """dp_shared_memory requires cpu_offload=True (upstream constraint).
@@ -2533,22 +2549,17 @@ class TestEngramSharedMemoryDefaults(TestBase):
             (1, 2, True),
             (2, 4, True),
         )
-        for use_v2 in (False, True):
-            for dp, pcp, _auto_shared in topologies:
-                for shared in (False, True):
-                    with self.subTest(use_v2=use_v2, dp=dp, pcp=pcp, shared=shared):
-                        config = VllmConfig(device_config=DeviceConfig(device="cpu"))
-                        config.parallel_config.data_parallel_size = dp
-                        config.parallel_config.prefill_context_parallel_size = pcp
-                        config.engram_config = SimpleNamespace(cpu_offload=False, dp_shared_memory=shared)
-                        ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig())
-                        with patch.object(
-                            _VllmConfig, "use_v2_model_runner", new_callable=PropertyMock, return_value=use_v2
-                        ):
-                            ascend_config.derive_and_validate(config)
-                        # dp_shared_memory must remain unchanged — never auto-enabled
-                        # when cpu_offload=False, regardless of DP/PCP/V2 topology.
-                        self.assertEqual(config.engram_config.dp_shared_memory, shared)
+        for dp, pcp, _auto_shared in topologies:
+            for shared in (False, True):
+                with self.subTest(dp=dp, pcp=pcp, shared=shared):
+                    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+                    config.parallel_config.data_parallel_size = dp
+                    config.parallel_config.prefill_context_parallel_size = pcp
+                    config.engram_config = SimpleNamespace(cpu_offload=False, dp_shared_memory=shared)
+                    ascend_config = AscendConfig(sparse_kv_offload_config=SparseKVOffloadConfig())
+                    ascend_config.derive_and_validate(config)
+                    # dp_shared_memory must remain unchanged when cpu_offload=False.
+                    self.assertEqual(config.engram_config.dp_shared_memory, shared)
 
     def test_no_engram_config_is_preserved(self):
         config = VllmConfig(device_config=DeviceConfig(device="cpu"))

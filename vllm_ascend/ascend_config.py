@@ -49,8 +49,8 @@ def is_mega_moe_supported() -> bool:
 
     Always read _MEGA_MOE_SUPPORTED through this accessor instead of
     ``from ascend_config import _MEGA_MOE_SUPPORTED``: the global is rebound
-    during config init (AscendConfig._validate_user_input_ranges rolls back
-    megamoe), and a direct import binds a stale snapshot for the bool.
+    when the worker config is published, and a direct import binds a stale
+    snapshot for the bool.
     """
     global _MEGA_MOE_SUPPORTED
     if _MEGA_MOE_SUPPORTED is None:
@@ -787,6 +787,7 @@ class AscendConfig:
     num_head_replica: int = 1
 
     # ---- private derived state (init=False) ----
+    _megamoe_supported: bool = dataclasses.field(default=False, init=False, repr=False)
     _sparse_li_c8_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c8_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c4_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
@@ -804,16 +805,15 @@ class AscendConfig:
         # We will first roll back the megamoe internally and keep `enable_fused_mc2=2`
         # to enable the megamoe for testing capabilities.
         # These codes will be removed after megamoe is ready.
-        global _MEGA_MOE_SUPPORTED
         if self.enable_fused_mc2 in (0, 1):
             # When enable_fused_mc2=1, roll back to dispatch_ffn_combine.
-            _MEGA_MOE_SUPPORTED = False
+            self._megamoe_supported = False
         elif self.enable_fused_mc2 in (2, 3):
             # =2: MegaMoe with the shared expert kept separate; =3: MegaMoe
             # with the shared expert fused into the operator.
             self.megamoe_shared_expert_fusion = self.enable_fused_mc2 == 3
-            _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not None
-            if self.enable_fused_mc2 == 3 and not _MEGA_MOE_SUPPORTED:
+            self._megamoe_supported = importlib.util.find_spec("cann_ops_transformer") is not None
+            if self.enable_fused_mc2 == 3 and not self._megamoe_supported:
                 logger.warning_once(
                     "enable_fused_mc2=3 requires the cann_ops_transformer package; "
                     "MegaMoe (and its shared-expert fusion) will be disabled."
@@ -838,8 +838,6 @@ class AscendConfig:
             os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "120")
         engram_config = getattr(vc, "engram_config", None)
         if self.shared_engram is not None and self.shared_engram.backend == "a3":
-            if not vc.use_v2_model_runner:
-                raise ValueError("shared_engram requires Model Runner V2")
             if not engram_config or not engram_config.cpu_offload:
                 raise ValueError("shared_engram requires Engram cpu_offload")
             if vc.load_config.load_format == "dummy" or vc.model_config.enable_sleep_mode:
@@ -848,7 +846,6 @@ class AscendConfig:
             engram_config is not None
             and getattr(engram_config, "cpu_offload", False)
             and not engram_config.dp_shared_memory
-            and vc.use_v2_model_runner
             and (vc.parallel_config.data_parallel_size > 1 or vc.parallel_config.prefill_context_parallel_size > 1)
         ):
             # DP-dummy ranks have no hash work in MRV2. Share host tables
@@ -950,17 +947,23 @@ class AscendConfig:
         is_minimax_m3 = any(architecture.startswith("MiniMaxM3") for architecture in model_architectures)
         # dispatch_ffn_combine (enable_fused_mc2=1 after MegaMoe rollback) does not
         # support MiniMax M3 SwiGLU-OAI. MegaMoe (enable_fused_mc2=2) is allowed.
-        assert not (self.enable_fused_mc2 == 1 and is_minimax_m3 and not is_mega_moe_supported()), (
+        assert not (self.enable_fused_mc2 == 1 and is_minimax_m3 and not self._megamoe_supported), (
             "MiniMax M3 does not support enable_fused_mc2=1 (dispatch_ffn_combine). "
             "Set additional_config.enable_fused_mc2 to 2 to enable MegaMoe, or 0 to disable fused MC2."
         )
+        # Use regular MoE for per-layer post-SiLU limits. Fall back before the
+        # shared-expert overlap check so the requested overlap is preserved.
+        fallback_for_swiglu_limits = self.enable_fused_mc2 == 1 and self._has_per_layer_swiglu_limit(vc)
+        if fallback_for_swiglu_limits:
+            self.enable_fused_mc2 = 0
+            logger.warning_once("Disabling fused MC2 because per-layer SwiGLU limits require regular MoE.")
         if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
             self.multistream_overlap_shared_expert = False
             logger.warning_once(
                 "enable_fused_mc2 and multistream_overlap_shared_expert "
                 "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
             )
-        if self.enable_fused_mc2 == 1 and is_mega_moe_supported() and not self._is_megamoe_supported_by_config(vc):
+        if self.enable_fused_mc2 == 1 and self._megamoe_supported and not self._is_megamoe_supported_by_config(vc):
             self.enable_fused_mc2 = 0
             logger.warning_once(
                 "MegaMoe is not supported for this model config; additional_config.enable_fused_mc2 will be set to 0."
@@ -1057,7 +1060,7 @@ class AscendConfig:
         ) = self._parse_sparse_li_layers_from_quant_config(quant_config, ("W8A8_MXFP8",))
         self._sparse_li_layer_filter_enabled = self._has_sparse_li_layer_config(quant_config)
         # vLLM #60517 removed the torch.compile-based sequence-parallelism pass
-        # (and `PassConfig.enable_sp`) in both v0.33.0 and verified main.
+        # (and `PassConfig.enable_sp`).
 
         enable_sp_by_pass = False
         self.enable_sp_by_pass = vc.model_config is not None and not vc.model_config.enforce_eager and enable_sp_by_pass
@@ -1094,6 +1097,10 @@ class AscendConfig:
 
         # sparse KV offload vs packed SFA main cache mutex
         self._validate_sparse_packed_kv_offload_compatibility()
+        if fallback_for_swiglu_limits:
+            # Keep the derived flags until the mode-3 hardware and model checks have run.
+            self._megamoe_supported = False
+            self.megamoe_shared_expert_fusion = False
         return self
 
     @property
@@ -1136,14 +1143,16 @@ class AscendConfig:
             )
 
     def _validate_megamoe_shared_expert_fusion(self, vllm_config: VllmConfig) -> None:
-        """Reject ``enable_fused_mc2=3`` on A3 and latent-MoE models.
+        """Reject ``enable_fused_mc2=3`` on unsupported hardware and latent-MoE models.
 
-        The shared expert is fused into the routed A5 MegaMoe operator, so this
-        contract is A5-only (``CANN_MEGAMOE_SHARED_EXPERT_FUSION``) and assumes
-        the shared expert and routed experts share the residual width. Latent-MoE
-        models (e.g. Kimi K3) project the residual stream before the routed FFN and
-        expose ``routed_expert_hidden_size``; the shared expert cannot be fused in
-        that layout. Fail fast instead of silently downgrading, because a silent
+        The shared expert is fused into the routed MegaMoe operator. The
+        capability ``CANN_MEGAMOE_SHARED_EXPERT_FUSION`` states that the platform
+        can run it; the payload family follows the machine's routed MegaMoe
+        contract (A5 MXFP, A3 arch22 INT8). Both assume the shared expert and the
+        routed experts share the residual width. Latent-MoE models (e.g. Kimi K3)
+        project the residual stream before the routed FFN and expose
+        ``routed_expert_hidden_size``; the shared expert cannot be fused in that
+        layout. Fail fast instead of silently downgrading, because a silent
         downgrade would change results without failing the launch.
         """
         if not self.megamoe_shared_expert_fusion:
@@ -1152,8 +1161,8 @@ class AscendConfig:
         hardware_profile = get_current_hardware_profile()
         if not hardware_profile.supports(HardwareCapability.CANN_MEGAMOE_SHARED_EXPERT_FUSION):
             raise NotImplementedError(
-                "enable_fused_mc2=3 (MegaMoe shared-expert fusion) is only supported on A5; "
-                "the current hardware profile does not support it. "
+                "enable_fused_mc2=3 (MegaMoe shared-expert fusion) is only supported on "
+                "A5 (MXFP) or A3 (INT8); the current hardware profile does not support it. "
                 "Set additional_config.enable_fused_mc2 to 0, 1, or 2."
             )
 
@@ -1202,6 +1211,14 @@ class AscendConfig:
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    @staticmethod
+    def _has_per_layer_swiglu_limit(vllm_config: VllmConfig) -> bool:
+        draft_model_config = getattr(vllm_config.speculative_config, "draft_model_config", None)
+        for model_config in (vllm_config.model_config, draft_model_config):
+            if any(getattr(getattr(model_config, "hf_text_config", None), "expert_swiglu_limit_list", None) or ()):
+                return True
+        return False
 
     @staticmethod
     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
@@ -1891,14 +1908,6 @@ class SparseKVOffloadConfig:
                     "you can enable keep_device_kv_cache."
                 )
         self.topk = vllm_config.model_config.hf_text_config.index_topk
-        speculative = getattr(vllm_config, "speculative_config", None)
-        if (
-            speculative is not None
-            and speculative.method == "dspark"
-            and not getattr(vllm_config, "use_v2_model_runner", False)
-        ):
-            # Only V2 initializes the resident draft KV from remote prompt context.
-            raise ValueError("Sparse KV offload with DSpark requires V2 remote prompt-context initialization")
         if self.topk_buffer_size < self.topk:
             raise ValueError(
                 "sparse_kv_offload_config.topk_buffer_size must be >= topk, "
@@ -1912,7 +1921,7 @@ _ASCEND_CONFIG: AscendConfig | None = None
 # ``getattr(_ASCEND_CONFIG, "vllm_config", None) is vllm_config`` check, now
 # that vllm_config is no longer a member of AscendConfig.
 _INIT_VLLM_CONFIG: Any = None
-# Only marks synchronous draft construction/loading for platform validation.
+# Marks synchronous draft construction/loading for validation and config publication.
 # Nested scopes restore their caller's marker, including on failure.
 _DRAFT_CONFIG_CONTEXT: ContextVar[bool] = ContextVar("ascend_draft_config", default=False)
 
@@ -1985,9 +1994,11 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         # Do not reuse a cached config: let AscendConfig's normal nested
         # pydantic validation report the invalid sub-config input below.
         refresh = True
-    global _ASCEND_CONFIG, _INIT_VLLM_CONFIG
+    global _ASCEND_CONFIG, _INIT_VLLM_CONFIG, _MEGA_MOE_SUPPORTED
+    is_draft = is_draft_config_context()
     if (
-        _ASCEND_CONFIG is not None
+        not is_draft
+        and _ASCEND_CONFIG is not None
         and not refresh
         and _is_ascend_config_initialized(_ASCEND_CONFIG)
         and _INIT_VLLM_CONFIG is vllm_config
@@ -2095,9 +2106,12 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    if is_draft:
+        return new_config
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config
+        _MEGA_MOE_SUPPORTED = new_config._megamoe_supported
         # Publish the fully validated singleton before invalidating derived
         # process caches. The next runtime read rebuilds them from new_config;
         # failed construction leaves the previous singleton/cache untouched.
