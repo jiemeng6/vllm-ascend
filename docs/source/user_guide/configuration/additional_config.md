@@ -115,7 +115,7 @@ verification batches can replay a full decode graph. Draft-model execution,
 profiling, and incompatible routers use native routing.
 
 For the algorithm, input constraints, and tests, see the
-[expert-pool operator document](https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/ops/triton/docs/deepseek_expert_pool.md).
+[expert-pool operator document](https://github.com/vllm-project/vllm-ascend/blob/159767fb7d15bdc21002737c459fe35d1fb4535c/vllm_ascend/ops/triton/docs/deepseek_expert_pool.md).
 
 <span id="runtime_guard"></span>**runtime_guard**
 
